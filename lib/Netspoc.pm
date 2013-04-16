@@ -8792,13 +8792,18 @@ sub cluster_path_mark ( $$$$$$ ) {
 
     # If start / end interface is part of a group of virtual
     # interfaces (VRRP, HSRP),
-    # prevent traffic through other interfaces of this group.
+    # disable traffic through other routers of the same group.
+    my @restriction_added;
     for my $intf ($start_intf, $end_intf) {
-        if ($intf and (my $interfaces = $intf->{redundancy_interfaces})) {
-            for my $interface (@$interfaces) {
-                next if $interface eq $intf;
+        $intf or next;
+        my $interfaces = $intf->{redundancy_interfaces} or next;
+        for my $redundancy_interface (@$interfaces) {
+            next if $redundancy_interface eq $intf;
+            my $router = $redundancy_interface->{router};
+            for my $interface (@{ $router->{interfaces} }) {
                 push @{ $interface->{path_restrict} },
                   $global_active_pathrestriction;
+                push @restriction_added, $interface;
             }
         }
     }
@@ -8897,13 +8902,8 @@ sub cluster_path_mark ( $$$$$$ ) {
     }
 
     # Remove temporary added path restrictions.
-    for my $intf ($start_intf, $end_intf) {
-        if ($intf and (my $interfaces = $intf->{redundancy_interfaces})) {
-            for my $interface (@$interfaces) {
-                next if $interface eq $intf;
-                pop @{ $interface->{path_restrict} };
-            }
-        }
+    for my $interface (@restriction_added) {
+        pop @{ $interface->{path_restrict} };
     }
 
     # Disable pathrestriction at border of loop.

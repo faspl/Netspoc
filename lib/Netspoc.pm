@@ -7347,19 +7347,33 @@ sub propagate_owners {
     return;
 }
 
+# Substitute auto-interfaces in $src_aref by real interfaces.
+# Expansion must not be ambiguous, because we show expanded groups 
+# of src, dst, user in Netspoc-Web.
 sub expand_auto_intf {
-    my ($src_aref, $dst_aref) = @_;
+    my ($src_aref, $dst_aref, $context) = @_;
     for (my $i = 0 ; $i < @$src_aref ; $i++) {
         my $src = $src_aref->[$i];
-        next if not is_autointerface($src);
-        my @new;
+        is_autointerface($src) or next;
+        my $prev;
+        my @expanded;
         for my $dst (@$dst_aref) {
-            push @new, path_auto_interfaces($src, $dst);
+            my @other = path_auto_interfaces($src, $dst);
+            if ($prev) {
+                next if aref_eq(\@expanded, \@other);
+                my $names1 = join(',', map { $_->{name} } @expanded);
+                my $names2 = join(',', map { $_->{name} } @other);
+                err_msg("$src->{name} expands ambiguously in $context:\n",
+                        "- $names1 for $prev->{name}\n",
+                        "- $names2 for $dst->{name}");
+                last;
+            }
+            $prev = $dst;
+            @expanded = @other;
         }
 
         # Substitute auto interface by real interface(s).
-        # Possible duplicate elements in @new are removed later.
-        splice(@$src_aref, $i, 1, @new);
+        splice(@$src_aref, $i, 1, @expanded);
     }
     return;
 }
@@ -7422,7 +7436,7 @@ sub set_service_owner {
         }
 
         # Expand auto interface of objects in rules to set of real interfaces.
-        expand_auto_intf(\@objects, $users);
+        expand_auto_intf(\@objects, $users, "rule of $sname");
 
         # Expand auto interfaces in users with counterpart in
         # - users and objects
@@ -7431,15 +7445,15 @@ sub set_service_owner {
         # Add elements of expanded users to objects.
         if ($is_coupling) {
             if (@objects) {
-                expand_auto_intf($users, [ @objects, @$users ]);
+                expand_auto_intf($users, [@objects, @$users], "user of $sname");
             }
             else {
-                expand_auto_intf($users, $users);
+                expand_auto_intf($users, $users, "user of $sname");
             }
             push @objects, @$users;
         }
         else {
-            expand_auto_intf($users, \@objects);
+            expand_auto_intf($users, \@objects, "user of $sname");
         }
 
         # Collect service owners and unknown owners;

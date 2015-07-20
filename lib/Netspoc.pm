@@ -15113,10 +15113,10 @@ sub distribute_rule {
     # in_intf is undefined if src is an interface of current router.
     # out_intf is undefined if dst is an interface of current router.
     # Outgoing packets from a router itself are never filtered.
-    return unless $in_intf;
-    my $router = $in_intf->{router};
-    return if not $router->{managed};
-    my $model = $router->{model};
+    $in_intf or return;
+    my $router  = $in_intf->{router};
+    my $managed = $router->{managed} or return;
+    my $model   = $router->{model};
 
     # Rules of type stateless must only be processed at
     # - stateless routers or
@@ -15156,6 +15156,11 @@ sub distribute_rule {
 
     # Don't generate code for src any:[interface:r.loopback] at router:r.
     return if $in_intf->{loopback};
+
+    # Ignore external rules at device which filters only locally.
+    if ($managed eq 'local' or $managed eq 'local_secondary') {
+        return if is_non_local_rule($rule, $in_intf, $out_intf);
+    }
 
     # Adapt rule to dynamic NAT.
     if (my $dynamic_nat = $rule->{dynamic_nat}) {
@@ -17157,6 +17162,38 @@ sub join_ranges  {
     return;
 }
 
+sub is_non_local_rule {
+    my ($rule, $in_intf, $out_intf) = @_;
+    $in_intf or $out_intf or return;
+    my $router = $in_intf->{router};
+    my $no_nat_set = 
+        ($in_intf->{no_in_acl} ? $out_intf : $in_intf)->{no_nat_set};
+    my $filter_only = $router->{filter_only};
+
+    # Don't remove deny rule
+    return if $rule->{deny};
+    my $both_match = 0;
+    for my $what (qw(src dst)) {
+        my $obj = $rule->{$what};
+        my ($ip, $mask) = @{ address($obj, $no_nat_set) };
+        for my $pair (@$filter_only) {
+            my ($i, $m) = @$pair;
+            
+            # src/dst matches filter_only or filter_only matches src/dst.
+            if ($mask > $m && match_ip($ip, $i, $m) ||
+                match_ip($i, $ip, $mask)) 
+            {
+                $both_match++;
+                last;
+            }
+        }
+    }
+
+    # Either src or dst or both are extern.
+    # The rule will not be filtered at this device.
+    return ($both_match < 2);
+}
+
 # Reuse network objects at different interfaces, 
 # so we get reused object-groups.
 my %filter_networks;
@@ -17171,50 +17208,6 @@ sub get_filter_network {
         $ref2obj{$net} = $net;
     }
     return $net;
-}
-
-# Remove rules on device which filters only locally.
-sub remove_non_local_rules {
-    my ($router, $hardware) = @_;
-    $router->{managed} =~ /^local/ or return;
-
-    my $no_nat_set = $hardware->{no_nat_set};
-    my $filter_only = $router->{filter_only};
-    for my $rules ('rules', 'out_rules') {
-        my $changed;
-        for my $rule (@{ $hardware->{$rules} }) {
-
-            # Don't remove deny rule
-            next if $rule->{deny};
-            my $both_match = 0;
-            for my $what (qw(src dst)) {
-                my $obj = $rule->{$what};
-                my ($ip, $mask) = @{ address($obj, $no_nat_set) };
-                for my $pair (@$filter_only) {
-                    my ($i, $m) = @$pair;
-
-                    # src/dst matches filter_only or
-                    # filter_only matches src/dst.
-                    if ($mask > $m && match_ip($ip, $i, $m) ||
-                        match_ip($i, $ip, $mask)) 
-                    {
-                        $both_match++;
-                        last;
-                    }
-                }
-            }
-
-            # Either src or dst or both are extern.
-            # The rule will not be filtered at this device.
-            if ($both_match < 2) {
-                $rule = undef;
-                $changed = 1;
-            }
-        }
-        $changed and 
-            $hardware->{$rules} = [ grep { $_ } @{ $hardware->{$rules} } ];
-    }
-    return;
 }
 
 # Add deny and permit rules at device which filters only locally.
@@ -17350,8 +17343,6 @@ sub local_optimization {
                     find_chains $router, $hardware;
                     next;
                 }
-
-                remove_non_local_rules($router, $hardware);
 
 #               my $rname = $router->{name};
 #               debug("$router->{name}");

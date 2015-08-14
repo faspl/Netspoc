@@ -28,8 +28,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 use strict;
 use warnings;
-use Module::Load::Conditional qw(can_load);
-my $can_json = can_load(modules => { JSON => 0.0 }) and JSON->import();
+use JSON;
 use open qw(:std :utf8);
 use Encode;
 my $filename_encode = 'UTF-8';
@@ -3581,8 +3580,6 @@ sub read_file_or_dir {
     closedir $dh;
 
     if (grep { $_ eq 'JSON' } @files) {
-        $can_json
-          or fatal_err("JSON module must be installed to read $path/JSON");
         $from_json = { JSON => 1 };
         if (-e "$path/JSON/owner") {
             $from_json->{watchers} = 1;
@@ -16107,7 +16104,6 @@ sub rules_distribution {
     }
 
     add_router_acls();
-    prepare_local_optimization();
 
     # No longer needed, free some memory.
     %expanded_rules = ();
@@ -18589,13 +18585,14 @@ EOF
                         prt => $prt_ip,
                     }
                 ];
-                find_object_groups($router, $id_intf);
-
-                # Define filter ACL to be used in username or group-policy.
                 my $filter_name = "vpn-filter-$user_counter";
-                my $prefix      = "access-list $filter_name extended";
-                print_cisco_acl_add_deny $router, $id_intf, $no_nat_set, $model,
-                  $prefix;
+                my $acl_info = {
+                    name => $filter_name,
+                    rules => $id_intf->{rules},
+                    add_deny => 1,
+                    no_nat_set => $no_nat_set,
+                };
+                push @{ $router->{acl_list} }, $acl_info;
 
                 my $ip      = print_ip $src->{ip};
                 my $network = $src->{network};
@@ -18712,14 +18709,14 @@ EOF
                 map { { src => $_, dst => $network_00, prt => $prt_ip, } }
                   @{ $interface->{peer_networks} }
             ];
-            find_object_groups($router, $interface);
-
-            # Define filter ACL to be used in username or group-policy.
             my $filter_name = "vpn-filter-$user_counter";
-            my $prefix      = "access-list $filter_name extended";
-
-            print_cisco_acl_add_deny $router, $interface, $no_nat_set, $model,
-              $prefix;
+            my $acl_info = {
+                name => $filter_name,
+                rules => $interface->{rules},
+                add_deny => 1,
+                no_nat_set => $no_nat_set,
+            };
+            push @{ $router->{acl_list} }, $acl_info;
 
             my $id = $interface->{peers}->[0]->{id}
               or internal_err("Missing ID at $interface->{peers}->[0]->{name}");
@@ -18831,11 +18828,7 @@ sub print_acl_suffix {
 }
 
 sub print_iptables_acls {
-    my ($router)     = @_;
-    my $model        = $router->{model};
-
-    print_chains $router;
-
+    my ($router) = @_;
     for my $hardware (@{ $router->{hardware} }) {
 
         # Ignore if all logical interfaces are loopback interfaces.
@@ -18844,33 +18837,33 @@ sub print_iptables_acls {
         my $in_hw      = $hardware->{name};
         my $no_nat_set = $hardware->{no_nat_set};
 
-        # Print chain and declaration for interface rules.
+        # Collect interface rules.
         # Add call to chain in INPUT chain.
         my $intf_acl_name = "${in_hw}_self";
-        print ":$intf_acl_name -\n";
+        my $acl_info = {
+            name => $intf_acl_name,
+            rules => $hardware->{intf_rules},
+            add_deny => 1,
+            no_nat_set => $no_nat_set,
+        };
+        push @{ $router->{acl_list} }, $acl_info;
         print "-A INPUT -j $intf_acl_name -i $in_hw\n";
-        my $intf_prefix = "-A $intf_acl_name";
-        for my $rule (@{ $hardware->{intf_rules} }) {
-            iptables_acl_line($rule, $no_nat_set, $intf_prefix);
-        }
 
-        # Print chain and declaration for forward rules.
-        # Add call to chain in FORRWARD chain.
+        # Collect forward rules.
         # One chain for each pair of in_intf / out_intf.
+        # Add call to chain in FORRWARD chain.
         my $rules_hash = $hardware->{io_rules};
         for my $out_hw (sort keys %$rules_hash) {
             my $acl_name = "${in_hw}_$out_hw";
-            print ":$acl_name -\n";
+            my $acl_info = {
+                name => $acl_name,
+                rules => $rules_hash->{$out_hw},
+                add_deny => 1,
+                no_nat_set => $no_nat_set,
+            };
+            push @{ $router->{acl_list} }, $acl_info;
             print "-A FORWARD -j $acl_name -i $in_hw -o $out_hw\n";
-            my $prefix     = "-A $acl_name";
-            my $rules_aref = $rules_hash->{$out_hw};
-            for my $rule (@$rules_aref) {
-                iptables_acl_line($rule, $no_nat_set, $prefix, $model);
-            }
         }
-
-        # Empty line after each chain.
-        print "\n";
     }
     return;
 }
@@ -18892,12 +18885,6 @@ sub print_cisco_acls {
         # when checking for non empty array.
         $hardware->{rules} ||= [];
 
-        if ($model->{can_objectgroup}) {
-            if (not $router->{no_group_code}) {
-                find_object_groups($router, $hardware);
-            }
-        }
-
         my $no_nat_set = $hardware->{no_nat_set};
 
         # Generate code for incoming and possibly for outgoing ACL.
@@ -18918,39 +18905,17 @@ sub print_cisco_acls {
             }
 
             my $acl_name = "$hardware->{name}_$suffix";
-            my $prefix;
-            if ($filter eq 'IOS') {
-                $prefix = '';
-                print "ip access-list extended $acl_name\n";
+            my $acl_info = {
+                name => $acl_name,
+                rules => $hardware->{rules},
+                intf_rules => $hardware->{intf_rules},
+                add_deny => 1,
+                no_nat_set => $no_nat_set,
+            };
+            if ($suffix eq 'in' and $router->{need_protect}) {
+                $acl_info->{protect_self} = 1
             }
-            elsif ($filter eq 'NX-OS') {
-                $prefix = '';
-                print "ip access-list $acl_name\n";
-            }
-            elsif ($filter eq 'ACE') {
-                $prefix = "access-list $acl_name extended";
-            }
-            elsif ($filter eq 'PIX') {
-                $prefix = "access-list $acl_name";
-                $prefix .= ' extended' if $model->{class} eq 'ASA';
-            }
-
-            # Incoming ACL and protect own interfaces.
-            if ($suffix eq 'in') {
-                print_cisco_acl_add_deny($router, $hardware, $no_nat_set,
-                    $model, $prefix);
-            }
-
-            # Outgoing ACL
-            else {
-                my $out_rules = $hardware->{out_rules} ||= [];
-
-                # Add deny rule at end of ACL if not 'permit ip any any'
-                if (!(@$out_rules && $out_rules->[-1] eq $permit_any_rule)) {
-                    push(@$out_rules, $deny_any_rule);
-                }
-                cisco_acl_line($router, $out_rules, $no_nat_set, $prefix);
-            }
+            push @{ $router->{acl_list} }, $acl_info;
 
             # Post-processing for hardware interface
             if ($filter eq 'IOS' || $filter eq 'NX-OS') {
@@ -18969,18 +18934,15 @@ sub print_cisco_acls {
                 print "access-group $acl_name $suffix interface",
                   " $hardware->{name}\n";
             }
-
-            # Empty line after each ACL.
-            print "\n";
         }
     }
     return;
 }
 
-sub print_acls {
-    my ($router)     = @_;
-    my $model        = $router->{model};
-    my $filter       = $model->{filter};
+sub generate_acls {
+    my ($router) = @_;
+    my $model    = $router->{model};
+    my $filter   = $model->{filter};
     print_header($router, 'ACL');
 
     if ($filter eq 'iptables') {
@@ -19067,22 +19029,26 @@ sub print_ezvpn {
     my $crypto_rules =
       gen_crypto_rules($tunnel_intf->{peers}->[0]->{peer_networks},
         [$network_00]);
-    print "ip access-list extended $crypto_acl_name\n";
-    my $prefix = '';
-    cisco_acl_line($router, $crypto_rules, $no_nat_set, $prefix);
+    my $acl_info = {
+        name => $crypto_acl_name,
+        rules => $crypto_rules,
+        no_nat_set => $no_nat_set,
+    };
+    push @{ $router->{acl_list} }, $acl_info;
 
     # Crypto filter ACL.
-    $prefix = '';
-    $tunnel_intf->{intf_rules} ||= [];
-    $tunnel_intf->{rules}      ||= [];
-    print "ip access-list extended $crypto_filter_name\n";
-    print_cisco_acl_add_deny($router, $tunnel_intf, $no_nat_set, $model,
-        $prefix);
+    $acl_info = {
+        name => $crypto_filter_name,
+        rules => $tunnel_intf->{rules} || [],
+        intf_rules => $tunnel_intf->{intf_rules} || [],
+        add_deny => 1,
+        no_nat_set => $no_nat_set,
+    };
+    push @{ $router->{acl_list} }, $acl_info;
 
     # Bind crypto filter ACL to virtual template.
     print "interface Virtual-Template$virtual_interface_number type tunnel\n";
-    $crypto_filter_name
-      and print " ip access-group $crypto_filter_name in\n";
+    print " ip access-group $crypto_filter_name in\n";
     return;
 }
 
@@ -19091,19 +19057,8 @@ sub print_ezvpn {
 sub print_crypto_acl {
     my ($interface, $suffix, $crypto, $crypto_type) = @_;
     my $crypto_acl_name = "crypto-$suffix";
-    my $prefix;
-    if ($crypto_type eq 'IOS') {
-        $prefix = '';
-        print "ip access-list extended $crypto_acl_name\n";
-    }
-    elsif ($crypto_type eq 'ASA') {
-        $prefix = "access-list $crypto_acl_name extended";
-    }
-    else {
-        internal_err();
-    }
 
-    # Print crypto ACL entries.
+    # Generate crypto ACL entries.
     # - either generic from remote network to any or
     # - detailed to all networks which are used in rules.
     my $is_hub   = $interface->{is_hub};
@@ -19115,7 +19070,12 @@ sub print_crypto_acl {
     my $crypto_rules = gen_crypto_rules($local, $remote);
     my $router       = $interface->{router};
     my $no_nat_set   = $interface->{no_nat_set};
-    cisco_acl_line($router, $crypto_rules, $no_nat_set, $prefix);
+    my $acl_info = {
+        name => $crypto_acl_name,
+        rules => $crypto_rules,
+        no_nat_set => $no_nat_set,
+    };
+    push @{ $router->{acl_list} }, $acl_info;
     return $crypto_acl_name;
 }
 
@@ -19127,18 +19087,17 @@ sub print_crypto_filter_acl {
 
     return if $router->{no_crypto_filter};
 
-    my $prefix;
     my $crypto_filter_name = "crypto-filter-$suffix";
-    if ($crypto_type eq 'IOS') {
-        $prefix = '';
-        print "ip access-list extended $crypto_filter_name\n";
-    }
-    else {
-        internal_err();
-    }
     my $model      = $router->{model};
     my $no_nat_set = $interface->{no_nat_set};
-    print_cisco_acl_add_deny($router, $interface, $no_nat_set, $model, $prefix);
+    my $acl_info = {
+        name => $crypto_filter_name,
+        rules => $interface->{rules} || [],
+        intf_rules => $interface->{intf_rules} || [],
+        add_deny => 1,
+        no_nat_set => $no_nat_set,
+    };
+    push @{ $router->{acl_list} }, $acl_info;
     return $crypto_filter_name;
 }
 
@@ -19617,6 +19576,155 @@ sub print_interface {
     return;
 }
 
+sub print_address {
+    my ($obj, $no_nat_set) = @_;
+    return prefix_code(address($obj, $no_nat_set));
+}
+
+sub print_prt {
+    my ($prt) = @_;
+    my $proto = $prt->{proto};
+    my @result = ($proto);
+
+    if ($proto eq 'tcp' or $proto eq 'udp') {
+        my ($v1, $v2) = @{ $prt->{range} };
+        if ($v1 == $v2) {
+            push @result, $v1;
+        }
+        elsif ($v1 == 1 and $v2 == 65535) {
+        }
+        else {
+            push @result, "$v1-$v2";
+        }
+        if (my $established = $prt->{established}) {
+            push @result, 'estab';
+        }
+    }
+    elsif ($proto eq 'icmp') {
+        if (defined(my $type = $prt->{type})) {
+            push @result, $type;
+        }
+        if (defined(my $code = $prt->{code})) {
+            push @result, $code;
+        }
+    }
+    return join(' ', @result);
+}
+
+sub print_acls {
+    my ($router, $acls, $fh) = @_;
+    @$acls or return;
+    my $managed          = $router->{managed};
+    my $secondary_filter = $managed =~ /secondary$/;
+    my $standard_filter  = $managed eq 'standard';
+    my $model            = $router->{model};
+    my $do_auth          = $model->{do_auth};
+    my %opt_addr;
+
+    for my $acl (@$acls) {
+        my $no_nat_set = delete $acl->{no_nat_set};
+        for my $what (qw(intf_rules rules)) {
+            my $rules = $acl->{$what} or next;
+            for my $rule (@$rules) {
+                my $new_rule = {};
+                $new_rule->{deny} = 1 if $rule->{deny};
+
+                my $opt_secondary;
+                if (   $secondary_filter && $rule->{some_non_secondary}
+                    || $standard_filter && $rule->{some_primary})
+                {
+                    $opt_secondary = 1;
+                }
+
+                for my $where (qw(src dst)) {
+                    my $obj = $rule->{$where};
+                    $new_rule->{$where} = print_address($obj, $no_nat_set);
+
+                    # Prepare secondary optimization.
+                    my $type = ref($obj);
+
+                    # Restrict secondary optimization at
+                    # authenticating router to prevent
+                    # unauthorized access with spoofed IP
+                    # address.
+                    if ($do_auth) {
+
+                        # Single ID-hosts must not be converted to
+                        # network.
+                        if ($type eq 'Subnet') {
+                            next if $obj->{id};
+                        }
+
+                        # Network with ID-hosts must not be optimized at all.
+                        if ($obj->{has_id_hosts}) {
+                            $opt_secondary = undef;
+                        }
+                    }
+
+                    if ($type eq 'Subnet' or $type eq 'Interface') {
+                        my $net = $obj->{network};
+                        next if $net->{has_other_subnet};
+                        $obj = $net;
+                    }
+                    if (my $max = $obj->{max_secondary_net}) {
+                        $obj = $max;
+                    }
+                    my $addr = print_address($obj, $no_nat_set);
+                    $opt_addr{$addr} = 1;
+                }
+                $new_rule->{opt_secondary} = 1 if $opt_secondary;
+
+                for my $where (qw(src_range prt)) {
+                    my $prt = $rule->{$where} or next;
+                    $new_rule->{$where} = print_prt($prt);
+                }
+                $rule = $new_rule;
+            }
+        }
+    }
+
+    my $result = { model => $model->{name}, acls  => $acls, };
+
+    if (keys %opt_addr) {
+        $result->{opt_secondary} = [ sort keys %opt_addr ];
+    }        
+
+    if (my $filter_only = $router->{filter_only}) {
+        my @list = map { prefix_code($_) } @$filter_only;
+        $result->{filter_only} = \@list;
+    }
+
+    if (
+        $router->{need_protect}
+        ||
+
+        # ASA protects IOS router behind crosslink interface.
+        $router->{crosslink_interfaces}
+      )
+    {
+
+        # Routers connected by crosslink networks are handled like one
+        # large router. Protect the collected interfaces of the whole
+        # cluster at each entry.
+        my $interfaces = $router->{crosslink_interfaces};
+        if (!$interfaces) {
+            $interfaces = $router->{interfaces};
+            $interfaces = [ 
+                grep({ $_->{ip} !~ /^(?:unnumbered|negotiated|tunnel|bridged)$/ } 
+                     @$interfaces) ];
+            if ($model->{has_vip}) {
+                $interfaces = [ grep { !$_->{vip} } @$interfaces ];
+            }
+        }
+        my @list = map { prefix_code(address($_, undef)) } @$interfaces;
+        $result->{need_protect} = \@list;
+    }
+
+    
+
+    print $fh to_json($result, { pretty => 1, canonical => 1 });
+}
+
 # Make output directory available.
 sub check_output_dir {
     my ($dir) = @_;
@@ -19650,12 +19758,14 @@ sub print_code {
 
         # Untaint $file. It has already been checked for word characters,
         # but check again for the case of a weird locale setting.
-        $file =~ /^(.*)/;
-        $file = "$dir/$1";
+        $file =~ s/^(.*)/$1/;
+
+        # File for router config without ACLs.
+        my $config_file = "$dir/$file.config";
 
         ## no critic (RequireBriefOpen)
-        open(my $code_fd, '>', $file)
-          or fatal_err("Can't open $file for writing: $!");
+        open(my $code_fd, '>', $config_file)
+          or fatal_err("Can't open $config_file for writing: $!");
         select $code_fd;
 
         my $model        = $router->{model};
@@ -19699,7 +19809,7 @@ sub print_code {
             $per_vrf->(\&print_routes);
             $per_vrf->(\&print_crypto);
             print_acl_prefix($router);
-            $per_vrf->(\&print_acls);
+            $per_vrf->(\&generate_acls);
             print_acl_suffix($router);
             $per_vrf->(\&print_interface);
             $per_vrf->(\&print_nat);
@@ -19710,8 +19820,17 @@ sub print_code {
 
         print "$comment_char [ END $device_name ]\n\n";
         select STDOUT;
-        close $code_fd or fatal_err("Can't close $file: $!");
+        close $code_fd or fatal_err("Can't close $config_file: $!");
         ## use critic
+
+        # Print ACLs in machine independent format into separate file.
+        # Collect ACLs from VRF parts.
+        my @acls = map { @{ $_->{acl_list} } } @$vrf_members;
+        my $acl_file = "$dir/$file.acls";
+        open(my $acl_fd, '>', $acl_file)
+          or fatal_err("Can't open $acl_file for writing: $!");
+        print_acls($router, \@acls, $acl_fd);
+        close $acl_fd or fatal_err("Can't close $acl_file: $!");
 
     }
     return;
@@ -20060,7 +20179,6 @@ sub compile {
     # No errors expected after this point.
     &set_abort_immediately();
     &rules_distribution();
-    &local_optimization();
     if ($out_dir) {
         &print_code($out_dir);
         copy_raw($in_path, $out_dir);

@@ -67,6 +67,14 @@ sub read_file {
     return $data;
 }
 
+sub read_file_lines {
+    my ($path) = @_;
+    open(my $fh, '<', $path) or fatal_err("Can't open $path");
+    my @lines = <$fh>;
+    close($fh);
+    return \@lines;
+}
+
 sub ip2int {
     my ($ip) = @_;
     $ip =~ m/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/ or fatal_err("Invalid IP $ip");
@@ -549,65 +557,58 @@ sub join_ranges {
 
 # Add deny and permit rules at device which filters only locally.
 sub add_local_deny_rules {
-    my ($acl_info, $filter_only, $network_00, $prt_ip) = @_;
+    my ($acl_info, $router_data) = @_;
+    my ($filter_only, $do_object_group, $network_00, $prt_ip) = 
+        @{$router_data}{qw(filter_only do_object_group network_00 prt_ip)};
     my $rules = $acl_info->{rules};
     
     my $src_networks = 
         $acl_info->{filter_any_src} ? [$network_00] : $filter_only;
 
-    my @filter_rules;
-    for my $src (@$src_networks) {
-        for my $dst (@$filter_only) {
-            push(@filter_rules,
-                 { deny => 1, src => $src, dst => $dst, prt => $prt_ip });
-        }
-    }
-    push @$rules, @filter_rules;
-    push @$rules, { src => $network_00, dst => $network_00, prt => $prt_ip };
-    return;
-}
+    if ($do_object_group) {
 
-# Given IP/prefix or group name, return its address in Cisco syntax.
-sub cisco_acl_addr {
-    my ($key, $model) = @_;
-    my ($ip, $prefix) = split '/', $key;
-
-    # Reference object group.
-    if ($ip =~ /^[^0-9]/) {
-        my $keyword =
-          $model->{filter} eq 'NX-OS' ? 'addrgroup' : 'object-group';
-        return "$keyword $key";
-    }
-    elsif ($prefix == 0) {
-        return "any";
-    }
-    elsif ($model =~ /^(:?NX-OS|ACE)/) {
-        return $key;
+        # If src and dst are object-group, both are known to be identical.
+        my $group;
+        my $group_or_single = sub {
+            my ($obj_list) = @_;
+            if (1 == @$obj_list) {
+                return $obj_list->[0];
+            }
+            elsif ($group) {
+                return $group;
+            }
+            else {
+                $router_data->{obj_group_counter}++;
+                $group = { name => "g$router_data->{obj_group_counter}",
+                              elements => map { $_->{name} } @$obj_list };
+                push @{ $acl_info->{object_groups} }, $group;
+                return $group;
+            }
+        };
+        push(@$rules, 
+             { deny => 1, 
+               src => $group_or_single->($src_networks), 
+               dst => $group_or_single->($filter_only), 
+               prt => $prt_ip });
     }
     else {
-        if (32 == $prefix) {
-            return "host $ip";
-        }
-        else {
-            my $mask = prefix2mask($prefix);
-
-            # Inverse mask bits.
-            $mask = complement_32bit($mask) if $model =~ /^(:?NX-OS|IOS)/;
-            my $mask_code = print_ip($mask);
-            return "$ip $mask_code";
+        for my $src (@$src_networks) {
+            for my $dst (@$filter_only) {
+                push(@$rules,
+                     { deny => 1, src => $src, dst => $dst, prt => $prt_ip });
+            }
         }
     }
+    push @$rules, { src => $network_00, dst => $network_00, prt => $prt_ip };
+    return;
 }
 
 my $min_object_group_size = 2;
 
 sub find_object_groups {
-    my ($acl_info, $model, $size2first2group_hash, $obj_group_counter) = @_;
-    my $keyword = $model eq 'NX-OS'
-                ? 'object-group ip address'
-                : 'object-group network';
+    my ($acl_info, $router_data, $size2first2group) = @_;
 
-    # Leave 'intf_rules' untouched, because they are handled
+    # Leave 'intf_rules' untouched, because
     # - these rules are ignored at ASA, PIX,
     # - NX-OS needs them individually when optimizing need_protect.
     my $rules = $acl_info->{rules};
@@ -659,32 +660,12 @@ sub find_object_groups {
 
         my $build_group = sub {
             my ($obj_key_list) = @_;
-            $obj_group_counter++;
-            my $group = { name => "g$obj_group_counter" };
+            $router_data->{obj_group_counter}++;
+            my $group = { name => "g$router_data->{obj_group_counter}", 
+                          elements => $obj_key_list };
 
-            # Print object-group.
-            my $numbered = 10;
-            print "$keyword $group->{name}\n";
-            for my $key (@$obj_key_list) {
-
-                # Reject network with mask = 0 in group.
-                # This occurs if optimization didn't work correctly.
-                $key eq '0.0.0.0/0'
-                    and fatal_err(
-                        "Unexpected network with mask 0 in object-group"
-                    );
-                my $adr = cisco_acl_addr($key, $model);
-                if ($model eq 'NX-OS') {
-                    print " $numbered $adr\n";
-                    $numbered += 10;
-                }
-                elsif ($model eq 'ACE') {
-                    print " $adr\n";
-                }
-                else {
-                    print " network-object $adr\n";
-                }
-            }
+            # Store group for later printing of its definition.
+            push @{ $acl_info->{object_groups} }, $group;
             return $group;
         };
 
@@ -701,7 +682,7 @@ sub find_object_groups {
             # Find group with identical elements.
           HASH:
             for my $group_hash (
-                @{ $size2first2group_hash->{$size}->{$first} })
+                @{ $size2first2group->{$size}->{$first} })
             {
                 my $href = $group_hash->{hash};
 
@@ -717,7 +698,7 @@ sub find_object_groups {
             # No group hash found, build new group hash with new group.
             my $group      = $build_group->(\@obj_key_list);
             my $group_hash = { hash  => $hash, group => $group, };
-            push(@{ $size2first2group_hash->{$size}->{$first} }, $group_hash);
+            push(@{ $size2first2group->{$size}->{$first} }, $group_hash);
             return $group;
         };
 
@@ -749,9 +730,11 @@ sub find_object_groups {
 
 sub gen_acls {
     my ($path) = @_;
-    my $rules_data = from_json(read_file($path));
-    my ($model, $acls, $opt_secondary, $filter_only) = 
-        @{$rules_data}{qw(model acls opt_secondary filter_only need_protect)};
+    my $router_data = from_json(read_file($path));
+    my ($model, $acls, $opt_secondary, $filter_only, $need_protect, 
+        $do_object_group) = 
+        @{$router_data}
+    {qw(model acls opt_secondary filter_only need_protect do_object_group)};
     
     my $ip_net2obj = {};
     my $prt2obj    = {};
@@ -774,10 +757,13 @@ sub gen_acls {
     }
 
     setup_ip_net_relation($ip_net2obj);
-    my $network_00 = $ip_net2obj->{'0.0.0.0/0'};
+    $router_data->{network_00} = $ip_net2obj->{'0.0.0.0/0'};
 
     my $prt_hash = setup_prt_relation($prt2obj);
-    my $prt_ip = $prt2obj->{ip};
+    my $prt_ip = $router_data->{prt_ip} = $prt2obj->{ip};
+
+    # Reuse identical groups.
+    my $obj_groups_hash   = {};
 
     for my $acl_info (@$acls) {
         for my $what (qw(intf_rules rules)) {
@@ -795,15 +781,94 @@ sub gen_acls {
             }
             $acl_info->{$what} = $rules;
         }
+        if ($do_object_group) {
+            find_object_groups($acl_info, $obj_groups_hash);
+        }
+
         if ($filter_only) {
-            add_local_deny_rules($acl_info, $filter_only, $network_00, $prt_ip);
+            add_local_deny_rules($acl_info, $router_data);
+        }
+        if ($need_protect) {
+            add_protect_rules($acl_info, $model, $need_protect);
         }
     }
-    return $rules_data;
+    return $router_data;
+}
+
+# Given IP/prefix or group name, return its address in Cisco syntax.
+sub cisco_acl_addr {
+    my ($key, $model) = @_;
+    my ($ip, $prefix) = split '/', $key;
+
+    # Reference object group.
+    if ($ip =~ /^[^0-9]/) {
+        my $keyword =
+          $model->{filter} eq 'NX-OS' ? 'addrgroup' : 'object-group';
+        return "$keyword $key";
+    }
+    elsif ($prefix == 0) {
+        return "any";
+    }
+    elsif ($model =~ /^(:?NX-OS|ACE)/) {
+        return $key;
+    }
+    else {
+        if (32 == $prefix) {
+            return "host $ip";
+        }
+        else {
+            my $mask = prefix2mask($prefix);
+
+            # Inverse mask bits.
+            $mask = complement_32bit($mask) if $model =~ /^(:?NX-OS|IOS)/;
+            my $mask_code = print_ip($mask);
+            return "$ip $mask_code";
+        }
+    }
+}
+
+sub print_object_groups {
+    my ($groups, $model) = @_;
+    my $keyword = $model eq 'NX-OS'
+                ? 'object-group ip address'
+                : 'object-group network';
+    for my $group (@$groups) {
+
+        my $numbered = 10;
+        print "$keyword $group->{name}\n";
+        for my $key (@{ $group->{elements} }) {
+
+            # Reject network with mask = 0 in group.
+            # This occurs if optimization didn't work correctly.
+            $key eq '0.0.0.0/0'
+                and fatal_err(
+                    "Unexpected network with mask 0 in object-group"
+                );
+            my $adr = cisco_acl_addr($key, $model);
+            if ($model eq 'NX-OS') {
+                print " $numbered $adr\n";
+                $numbered += 10;
+            }
+            elsif ($model eq 'ACE') {
+                print " $adr\n";
+            }
+            else {
+                print " network-object $adr\n";
+            }
+        }
+    }
+}
+
+sub print_acl_lines {
+    my ($acl_info, $model) = @_;
+
+    if (my $groups = $acl_info->{object_group}) {
+        print_object_groups($groups, $model);
+    }
 }
 
 sub print_combined {
-    my ($config, $rules_data, $out_path) = @_;
+    my ($config, $router_data, $out_path) = @_;
 
     # Redirect print statements to $out_path.
     ## no critic (RequireBriefOpen)
@@ -811,27 +876,16 @@ sub print_combined {
         or fatal_err("Can't open $out_path for writing: $!");
     select $out_fd;
 
-    my ($model, $do_object_group, $acls, $need_protect) = 
-        @{$rules_data}{qw(model do_object_group acls need_protect)};
-
-    # Reuse identical groups.
-    my $obj_groups_hash   = {};
-    my $obj_group_counter = 0;
+    my ($acls, $model) = @{$router_data}{qw(acls model)};
+    my %acl_hash = map { $_->{name} => $_ } @$acls;
 
     # Print config and insert printed ACLs at "#insert <name>" markers.
     for my $line (@$config) {
 
         # Print ACL.
         if (my ($acl_name) = ($line =~ /^#insert (.*)\n$/)) {
-            my $acl_info = $acls->{$acl_name} or 
+            my $acl_info = $acl_hash{$acl_name} or 
                 fatal_err("Unexpected ACL $acl_name");
-            if ($do_object_group) {
-                find_object_groups($acl_info, $model, 
-                                   $obj_groups_hash, $obj_group_counter);
-            }
-            if ($need_protect) {
-                acl_add_deny($acl_info, $model, $need_protect);
-            }
             print_acl_lines($acl_info, $model);
         }
 
@@ -851,10 +905,10 @@ sub print_combined {
 sub pass2 {
     my ($args) = @_;
     my ($rules_path, $config_path, $out_path, @extra) = @$args;
-    ($rules_path && $config_path && $out || @extra) or pod2usage(2);
-    my $rules_data = gen_acls($rules_path);
-    my $config = [ read_file_lines($config_path) ];
-    print_combined($config, $rules_data, $out_path);
+    ($rules_path && $config_path && $out_path || @extra) or pod2usage(2);
+    my $router_data = gen_acls($rules_path);
+    my $config = read_file_lines($config_path);
+    print_combined($config, $router_data, $out_path);
 }
 
 pass2(\@ARGV);

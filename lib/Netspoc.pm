@@ -17558,660 +17558,6 @@ sub print_chains {
     return;
 }
 
-# Find adjacent port ranges.
-sub join_ranges {
-    my ($router, $hardware) = @_;
-    my $changed;
-    my $active_log = $router->{log};
-    for my $rules ('intf_rules', 'rules', 'out_rules') {
-        my %hash = ();
-      RULE:
-        for my $rule (@{ $hardware->{$rules} }) {
-            my ($deny, $src, $dst, $src_range, $prt) =
-              @{$rule}{qw(deny src dst src_range prt)};
-
-            # Only ranges which have a neighbor may be successfully optimized.
-            # Currently only dst_ranges are handled.
-            $prt->{has_neighbor} or next;
-
-            $deny      ||= '';
-            $src_range ||= '';
-            $hash{$deny}->{$src}->{$dst}->{$src_range}->{$prt} = $rule;
-        }
-
-        # %hash is {deny => href, ...}
-        for my $href (values %hash) {
-
-            # $href is {src => href, ...}
-            for my $href (values %$href) {
-
-                # $href is {dst => href, ...}
-                for my $href (values %$href) {
-
-                    # $href is {src_range => href, ...}
-                    for my $src_range_ref (keys %$href) {
-                        my $href = $href->{$src_range_ref};
-
-                        # Nothing to do if only a single rule.
-                        next if values %$href == 1;
-
-                        # Values of %$href are rules with identical
-                        # deny/src/dst/src_range and a TCP or UDP protocol.
-                        #
-                        # Collect rules with identical log type and
-                        # identical protocol.
-                        my %key2rules;
-                        for my $rule (values %$href) {
-                            my $key = $rule->{prt}->{proto};
-                            if (my $log = $rule->{log}) {
-                                for my $tag (@$log) {
-                                    if (defined(my $type = $active_log->{$tag}))
-                                    {
-                                        $key .= ",$type";
-                                        last;
-                                    }
-                                }
-                            }
-                            push @{ $key2rules{$key} }, $rule;
-                        }
-
-                        for my $rules (values %key2rules) {
-
-                            # When sorting these rules by low port number,
-                            # rules with adjacent protocols will placed
-                            # side by side. There can't be overlaps,
-                            # because they have been split in function
-                            # 'order_ranges'.  There can't be sub-ranges,
-                            # because they have been deleted as redundant
-                            # above.
-                            my @sorted = sort {
-                                $a->{prt}->{range}->[0]
-                                  <=> $b->{prt}->{range}->[0]
-                            } @$rules;
-                            @sorted >= 2 or next;
-                            my $i      = 0;
-                            my $rule_a = $sorted[$i];
-                            my ($a1, $a2) = @{ $rule_a->{prt}->{range} };
-                            while (++$i < @sorted) {
-                                my $rule_b = $sorted[$i];
-                                my ($b1, $b2) = @{ $rule_b->{prt}->{range} };
-                                if ($a2 + 1 == $b1) {
-
-                                    # Found adjacent port ranges.
-                                    if (my $range = delete $rule_a->{range}) {
-
-                                        # Extend range of previous two or
-                                        # more elements.
-                                        $range->[1] = $b2;
-                                        $rule_b->{range} = $range;
-                                    }
-                                    else {
-
-                                        # Combine ranges of $rule_a and $rule_b.
-                                        $rule_b->{range} = [ $a1, $b2 ];
-                                    }
-
-                                    # Mark previous rule as deleted.
-                                    # Don't use attribute 'deleted', this
-                                    # may still be set by global
-                                    # optimization pass.
-                                    $rule_a->{local_del} = 1;
-                                    $changed = 1;
-                                }
-                                $rule_a = $rule_b;
-                                ($a1, $a2) = ($b1, $b2);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if ($changed) {
-            my @rules;
-            for my $rule (@{ $hardware->{$rules} }) {
-
-                # Check and remove attribute 'local_del'.
-                next if delete $rule->{local_del};
-
-                # Process rules with joined port ranges.
-                # Remove auxiliary attribute {range} from rules.
-                if (my $range = delete $rule->{range}) {
-                    my $prt   = $rule->{prt};
-                    my $proto = $prt->{proto};
-                    my $key   = join(':', @$range);
-
-                    # Try to find existing prt with matching range.
-                    # This is needed for find_object_groups to work.
-                    my $new_prt = $prt_hash{$proto}->{$key};
-                    unless ($new_prt) {
-                        $new_prt = {
-                            name  => "joined:$prt->{name}",
-                            proto => $proto,
-                            range => $range
-                        };
-                        $prt_hash{$proto}->{$key} = $new_prt;
-                    }
-                    my $new_rule = { %$rule, prt => $new_prt };
-                    push @rules, $new_rule;
-                }
-                else {
-                    push @rules, $rule;
-                }
-            }
-            $hardware->{$rules} = \@rules;
-        }
-    }
-    return;
-}
-
-# Reuse network objects at different interfaces,
-# so we get reused object-groups.
-my %filter_networks;
-
-sub get_filter_network {
-    my ($ip, $mask) = @_;
-    my $key = "$ip/$mask";
-    my $net = $filter_networks{$key};
-    if (!$net) {
-        $net = new('Network', ip => $ip, mask => $mask);
-        $filter_networks{$key} = $net;
-        $ref2obj{$net}         = $net;
-    }
-    return $net;
-}
-
-# Add deny and permit rules at device which filters only locally.
-sub add_local_deny_rules {
-    my ($router, $hardware) = @_;
-    $router->{managed} =~ /^local/ or return;
-    $hardware->{crosslink} and return;
-
-    my $filter_only = $router->{filter_only};
-    my @dst_networks = map { get_filter_network(@$_) } @$filter_only;
-
-    for my $attr (qw(rules out_rules)) {
-
-        next if $attr eq 'rules'     && $hardware->{no_in_acl};
-        next if $attr eq 'out_rules' && !$hardware->{need_out_acl};
-
-        # If attached zone has only one connection to this firewall
-        # than we don't need to check the source address.  It has
-        # already been checked, that all networks of this zone match
-        # {filter_only}.
-        my $check = sub {
-            $attr eq 'out_rules' and return;
-            for my $interface (@{ $hardware->{interfaces} }) {
-                my $zone = $interface->{zone};
-                $zone->{zone_cluster} and return;
-
-                # Ignore real interface of virtual interface.
-                my @interfaces =
-                  grep({ !$_->{main_interface} } @{ $zone->{interfaces} });
-
-                if (@interfaces > 1) {
-
-                    # Multilpe interfaces belonging to one redundancy
-                    # group can't be used to cross the zone.
-                    my @redundant =
-                      grep { $_ }
-                      map  { $_->{redundancy_interfaces} } @interfaces;
-                    @redundant == @interfaces and equal(@redundant)
-                      or return;
-                }
-            }
-            return 1;
-        };
-        my @src_networks = $check->() ? ($network_00) : @dst_networks;
-
-        my @filter_rules;
-        for my $src (@src_networks) {
-            for my $dst (@dst_networks) {
-                push(
-                    @filter_rules,
-                    {
-                        deny => 1,
-                        src  => $src,
-                        dst  => $dst,
-                        prt  => $prt_ip
-                    }
-                );
-            }
-        }
-        my $rules = $hardware->{$attr};
-        push @$rules, @filter_rules, $permit_any_rule;
-    }
-    return;
-}
-
-sub prepare_local_optimization {
-
-    # Prepare rules for local_optimization.
-    # Aggregates with mask 0 are converted to network_00, to be able
-    # to compare with internally generated rules which use network_00.
-    for my $rule (@{ $expanded_rules{permit} }) {
-        next if $rule->{deleted} and not $rule->{managed_intf};
-        my ($src, $dst) = @{$rule}{qw(src dst)};
-        $rule->{src} = $network_00 if is_network($src) && $src->{mask} == 0;
-        $rule->{dst} = $network_00 if is_network($dst) && $dst->{mask} == 0;
-    }
-    return;
-}
-
-#use Time::HiRes qw ( time );
-sub local_optimization {
-    return if fast_mode();
-    progress('Optimizing locally');
-
-    # Needed in find_chains.
-    $ref2obj{$network_00} = $network_00;
-
-    my %seen;
-
-# For debugging only
-#    my %time;
-#    my %r2rules;
-#    my %r2id;
-#    my %r2del;
-#    my %r2sec;
-    for my $domain (@natdomains) {
-        my $no_nat_set = $domain->{no_nat_set};
-
-        # Subnet relation may be different for each NAT domain,
-        # therefore it is set up again for each NAT domain.
-        for my $network (@networks) {
-            next if !$network->{mask} || $network->{mask} == 0;
-            my $up = $network->{is_in}->{$no_nat_set};
-            if (!$up || $up->{mask} == 0) {
-                $up = $network_00;
-            }
-            $network->{up} = $up;
-        }
-
-        for my $network (@{ $domain->{networks} }) {
-
-            # Iterate over all interfaces attached to current network.
-            # If interface is virtual tunnel for multiple software clients,
-            # take separate rules for each software client.
-            for my $interface (
-                map { $_->{id_rules} ? values %{ $_->{id_rules} } : $_ }
-                @{ $network->{interfaces} })
-            {
-                my $router           = $interface->{router};
-                my $managed          = $router->{managed} or next;
-                my $secondary_filter = $managed =~ /secondary$/;
-                my $standard_filter  = $managed eq 'standard';
-                my $do_auth          = $router->{model}->{do_auth};
-                my $hardware =
-                    $interface->{ip} eq 'tunnel'
-                  ? $interface
-                  : $interface->{hardware};
-
-                # Do local optimization only once for each hardware interface.
-                next if $seen{$hardware};
-                $seen{$hardware} = 1;
-
-                if ($router->{model}->{filter} eq 'iptables') {
-                    find_chains $router, $hardware;
-                    next;
-                }
-
-#               my $rname = $router->{name};
-#               debug("$router->{name}");
-                for my $rules ('intf_rules', 'rules', 'out_rules') {
-
-#                    my $t1 = time();
-
-                    # For supernet / aggregate rules used in optimization.
-                    my %hash;
-
-                    # For finding duplicate rules having src or dst
-                    # which exist as different objects with identical
-                    # ip address.
-                    my %id_hash;
-
-                    # For finding duplicate secondary rules.
-                    my %id_hash2;
-
-                    my $changed = 0;
-                    for my $rule (@{ $hardware->{$rules} }) {
-
-                        # Change rule to allow optimization of objects
-                        # having identical IP address.
-                        for my $what (qw(src dst)) {
-                            my $obj = $rule->{$what};
-                            my $obj_changed;
-
-                            # Change loopback interface to loopback network.
-                            # The loopback network is additionally checked
-                            # below.
-                            if ($obj->{loopback}
-                                && (my $network = $obj->{network}))
-                            {
-                                if (!($rules eq 'intf_rules' && $what eq 'dst'))
-                                {
-                                    $obj         = $network;
-                                    $obj_changed = 1;
-                                }
-                            }
-
-                            # Identical networks from dynamic NAT and
-                            # from identical aggregates.
-                            if (my $identical = $obj->{is_identical}) {
-                                if (my $other = $identical->{$no_nat_set}) {
-                                    $obj         = $other;
-                                    $obj_changed = 1;
-                                }
-                            }
-
-                            # Identical redundancy interfaces.
-                            elsif (my $aref = $obj->{redundancy_interfaces}) {
-                                if (
-                                    !($rules eq 'intf_rules' && $what eq 'dst')
-                                    || (   $router->{crosslink_intf_hash}
-                                        && $router->{crosslink_intf_hash}
-                                        ->{ $aref->[0] })
-                                  )
-                                {
-                                    $obj         = $aref->[0];
-                                    $obj_changed = 1;
-                                }
-                            }
-
-                            $obj_changed or next;
-
-                            # Don't change rules of devices in other
-                            # NAT domain where we may have other
-                            # relation.
-                            $rule = { %$rule, $what => $obj };
-                        }
-                        my ($src, $dst, $deny, $src_range, $prt) =
-                          @{$rule}{qw(src dst deny src_range prt)};
-                        $deny ||= '';
-                        $src_range ||= $prt_ip;
-
-                        # Remove duplicate rules.
-                        if ($id_hash{$deny}->{$src_range}->{$src}->{$dst}
-                            ->{$prt})
-                        {
-                            $rule    = undef;
-                            $changed = 1;
-
-#                            $r2id{$rname}++;
-                            next;
-                        }
-                        $id_hash{$deny}->{$src_range}->{$src}->{$dst}->{$prt} =
-                          $rule;
-
-                        if (   $src->{is_supernet}
-                            || $dst->{is_supernet}
-                            || $rule->{stateless})
-                        {
-                            $hash{$deny}->{$src_range}->{$src}->{$dst}->{$prt}
-                              = $rule;
-                        }
-                    }
-
-#                    my $t2 = time();
-#                    $time{$rname}[0] += $t2-$t1;
-                  RULE:
-                    for my $rule (@{ $hardware->{$rules} }) {
-                        next if not $rule;
-
-#                        my $t3 = time();
-#                        $r2rules{$rname}++;
-
-#                       debug(print_rule $rule);
-#                       debug "is_supernet" if $rule->{dst}->{is_supernet};
-                        my ($deny, $src, $dst, $src_range, $prt, $log) =
-                          @{$rule}{qw(deny src dst src_range prt log)};
-                        $deny      ||= '';
-                        $src_range ||= $prt_ip;
-                        $log       ||= '';
-
-                        while (1) {
-                            my $src_range = $src_range;
-                            if (my $hash = $hash{$deny}) {
-                                while (1) {
-                                    my $src = $src;
-                                    if (my $hash = $hash->{$src_range}) {
-                                        while (1) {
-                                            my $dst = $dst;
-                                            if (my $hash = $hash->{$src}) {
-                                                while (1) {
-                                                    my $prt = $prt;
-                                                    if (my $hash =
-                                                        $hash->{$dst})
-                                                    {
-                                                        while (1) {
-                                                            if (
-                                                                my $other_rule
-                                                                = $hash->{$prt})
-                                                            {
-                                                                my $o_log =
-                                                                  $other_rule
-                                                                  ->{log} || '';
-                                                                if ($rule ne
-                                                                    $other_rule
-                                                                    && $log eq
-                                                                    $o_log)
-                                                                {
-
-#                                  debug("del:", print_rule $rule);
-#                                  debug("oth:", print_rule $other_rule);
-                                                                    $rule =
-                                                                      undef;
-
-#                                  $r2del{$rname}++;
-                                                                    $changed =
-                                                                      1;
-
-#                                  $time{$rname}[1] += time()-$t3;
-                                                                    next RULE;
-                                                                }
-                                                            }
-                                                            $prt = $prt->{up}
-                                                              or last;
-                                                        }
-                                                    }
-                                                    $dst = $dst->{up} or last;
-                                                }
-                                            }
-                                            $src = $src->{up} or last;
-                                        }
-                                    }
-                                    $src_range = $src_range->{up} or last;
-                                }
-                            }
-                            last if $deny;
-                            $deny = 1;
-                        }
-
-#                        my $t4 = time();
-#                        $time{$rname}[1] += $t4-$t3;
-
-                        # Implement remaining rules as secondary rule,
-                        # if possible.
-                        if (   $secondary_filter && $rule->{some_non_secondary}
-                            || $standard_filter && $rule->{some_primary})
-                        {
-                            $rule->{deny} and internal_err();
-                            my ($src, $dst) = @{$rule}{qw(src dst)};
-
-                            # Replace obj by largest supernet in zone,
-                            # which has no subnet in other zone.
-                            # We must not change to network having subnet in
-                            # other zone, because then we had to do
-                            # check_supernet_rules for newly created
-                            # secondary rules.
-                            for my $ref (\$src, \$dst) {
-
-                                # Restrict secondary optimization at
-                                # authenticating router to prevent
-                                # unauthorized access with spoofed IP
-                                # address.
-                                if ($do_auth) {
-                                    my $type = ref($$ref);
-
-                                    # Single ID-hosts must not be
-                                    # converted to network.
-                                    if ($type eq 'Subnet') {
-                                        next if $$ref->{id};
-                                    }
-
-                                    # Network with ID-hosts must not
-                                    # be optimized at all.
-                                    elsif ($type eq 'Network') {
-                                        next RULE if $$ref->{has_id_hosts};
-                                    }
-                                }
-                                if (
-                                       $$ref eq $dst
-                                    && is_interface($dst)
-                                    && (
-                                        $dst->{router} eq $router
-                                        || (    $router->{crosslink_intf_hash}
-                                            and $router->{crosslink_intf_hash}
-                                            ->{$dst})
-                                    )
-                                  )
-                                {
-                                    next;
-                                }
-                                if (is_subnet($$ref) || is_interface($$ref)) {
-                                    my $net = $$ref->{network};
-                                    next if $net->{has_other_subnet};
-                                    $$ref = $net;
-                                }
-                                if (my $max = $$ref->{max_secondary_net}) {
-                                    $$ref = $max;
-                                }
-
-                                # Prevent duplicate ACLs for networks which
-                                # are translated to the same ip address.
-                                if (my $identical = $$ref->{is_identical}) {
-                                    if (my $one_net = $identical->{$no_nat_set})
-                                    {
-                                        $$ref = $one_net;
-                                    }
-                                }
-                            }
-
-                            # Add new rule to hash. If there are multiple
-                            # rules which could be converted to the same
-                            # secondary rule, only the first one will be
-                            # generated.
-                            if (my $old = $id_hash2{$src}->{$dst}) {
-
-                                if ($old ne $rule) {
-
-#				    debug("sec delete: ", print_rule $rule);
-
-                                    $rule    = undef;
-                                    $changed = 1;
-
-#                                    $r2sec{$rname}++;
-                                }
-                            }
-                            else {
-
-                                # Don't modify original rule, because the
-                                # identical rule is referenced at different
-                                # routers.
-                                my $new_rule = {
-                                    src => $src,
-                                    dst => $dst,
-                                    prt => $prt_ip,
-                                };
-                                $new_rule->{log} = $rule->{log} if $rule->{log};
-
-#				debug("sec: ", print_rule $new_rule);
-                                $id_hash2{$src}->{$dst} = $new_rule;
-
-                                # This only works if smaller rule isn't
-                                # already processed.
-                                if ($src->{is_supernet} || $dst->{is_supernet})
-                                {
-                                    $hash{''}->{$prt_ip}->{$src}->{$dst}
-                                      ->{$prt_ip} = $new_rule;
-                                }
-
-                                # This changes @{$hardware->{$rules}} !
-                                $rule = $new_rule;
-                            }
-                        }
-
-#                        my $t5 = time();
-#                        $time{$rname}[2] += $t5-$t4;
-                    }
-                    if ($changed) {
-                        $hardware->{$rules} =
-                          [ grep { defined $_ } @{ $hardware->{$rules} } ];
-                    }
-                }
-
-                add_local_deny_rules($router, $hardware);
-
-                # Join adjacent port ranges.  This must be called after local
-                # optimization has been finished, because protocols will be
-                # overlapping again after joining.
-#                my $t6 = time();
-                join_ranges($router, $hardware);
-
-#                $time{$rname}[3] += time() - $t6;
-            }
-        }
-    }
-
-#    my ($orules, $oid, $odel, $osec, $arules, $aid, $adel, $asec,
-#        @otime, @atime);
-#    my $f = '%-12s %7i %7i %7i %7i %.3f %.3f %.3f %.3f %.3f';
-#    for my $aref (values %time) {
-#        $aref->[4] = $aref->[0] + $aref->[1] + $aref->[2] + $aref->[3];
-#        $atime[0] += $aref->[0];
-#        $atime[1] += $aref->[1];
-#        $atime[2] += $aref->[2];
-#        $atime[3] += $aref->[3];
-#        $atime[4] += $aref->[4];
-#    }
-#    for my $name (sort { $time{$a}[4] <=> $time{$b}[4] } keys %time) {
-#        my $pre = $time{$name}[0];
-#        my $while = $time{$name}[1];
-#        my $secon = $time{$name}[2];
-#        my $join = $time{$name}[3];
-#        my $sum = $time{$name}[4];
-#        my $rules = $r2rules{$name};
-#        my $id = $r2id{$name} || 0;
-#        my $del = $r2del{$name} || 0;
-#        my $sec = $r2sec{$name} || 0;
-#        $arules += $rules;
-#        $aid += $id;
-#        $adel += $del;
-#        $asec += $sec;
-#        if ($sum < 0.5) {
-#            $otime[0] += $pre;
-#            $otime[1] += $while;
-#            $otime[2] += $secon;
-#            $otime[3] += $join;
-#            $otime[4] += $sum;
-#            $orules += $rules;
-#            $odel += $del;
-#            $oid += $id;
-#            $osec += $sec;
-#        }
-#        else {
-#            $name =~ s/^router://;
-#            debug(sprintf( $f, $name, $rules, $id, $del, $sec,
-#                           $pre, $while, $secon, $join, $sum));
-#        }
-#    }
-#    debug(sprintf( $f, 'other', $orules, $oid, $odel, $osec,
-#                   $otime[0], $otime[1], $otime[2], $otime[3], $otime[4]));
-#    debug(sprintf( $f, 'all', $arules, $aid, $adel, $asec,
-#                   $atime[0], $atime[1], $atime[2], $atime[3], $atime[4]));
-
-    return;
-}
-
 my $deny_any_rule;
 
 sub print_cisco_acl_add_deny {
@@ -18414,6 +17760,11 @@ sub print_cisco_acl_add_deny {
     return;
 }
 
+sub print_acl_placeholder {
+    my ($acl_name) = @_;
+    print "#insert $acl_name\n";
+}
+
 # Parameter: Interface
 # Analyzes dst of all rules collected at this interface.
 # Result:
@@ -18593,6 +17944,7 @@ EOF
                     no_nat_set => $no_nat_set,
                 };
                 push @{ $router->{acl_list} }, $acl_info;
+                print_acl_placeholder($filter_name);
 
                 my $ip      = print_ip $src->{ip};
                 my $network = $src->{network};
@@ -18717,6 +18069,7 @@ EOF
                 no_nat_set => $no_nat_set,
             };
             push @{ $router->{acl_list} }, $acl_info;
+            print_acl_placeholder($filter_name);
 
             my $id = $interface->{peers}->[0]->{id}
               or internal_err("Missing ID at $interface->{peers}->[0]->{name}");
@@ -18847,6 +18200,7 @@ sub print_iptables_acls {
             no_nat_set => $no_nat_set,
         };
         push @{ $router->{acl_list} }, $acl_info;
+        print_acl_placeholder($intf_acl_name);
         print "-A INPUT -j $intf_acl_name -i $in_hw\n";
 
         # Collect forward rules.
@@ -18862,6 +18216,7 @@ sub print_iptables_acls {
                 no_nat_set => $no_nat_set,
             };
             push @{ $router->{acl_list} }, $acl_info;
+            print_acl_placeholder($acl_name);
             print "-A FORWARD -j $acl_name -i $in_hw -o $out_hw\n";
         }
     }
@@ -18869,9 +18224,10 @@ sub print_iptables_acls {
 }
 
 sub print_cisco_acls {
-    my ($router)     = @_;
-    my $model        = $router->{model};
-    my $filter       = $model->{filter};
+    my ($router)      = @_;
+    my $model         = $router->{model};
+    my $filter        = $model->{filter};
+    my $managed_local = $router->{managed} =~ /^local/;
 
     for my $hardware (@{ $router->{hardware} }) {
 
@@ -18907,15 +18263,60 @@ sub print_cisco_acls {
             my $acl_name = "$hardware->{name}_$suffix";
             my $acl_info = {
                 name => $acl_name,
-                rules => $hardware->{rules},
-                intf_rules => $hardware->{intf_rules},
                 add_deny => 1,
                 no_nat_set => $no_nat_set,
             };
-            if ($suffix eq 'in' and $router->{need_protect}) {
-                $acl_info->{protect_self} = 1
+
+            # - Collect incoming ACLs,
+            # - protect own interfaces,
+            # - set {filter_any_src}.
+            if ($suffix eq 'in') {
+                $acl_info->{rules} = $hardware->{rules};
+                $acl_info->{intf_rules} = $hardware->{intf_rules};
+                if ($router->{need_protect}) {
+                    $acl_info->{protect_self} = 1;
+                }
+
+                if ($managed_local) {
+
+                    # If attached zone has only one connection to this
+                    # firewall than we don't need to check the source
+                    # address. It has already been checked, that all
+                    # networks of this zone match {filter_only}.
+                    my $intf_ok = 0;
+                    for my $interface (@{ $hardware->{interfaces} }) {
+                        my $zone = $interface->{zone};
+                        $zone->{zone_cluster} and last;
+                        
+                        # Ignore real interface of virtual interface.
+                        my @interfaces = grep({ !$_->{main_interface} } 
+                                              @{ $zone->{interfaces} });
+                        
+                        if (@interfaces > 1) {
+                            
+                            # Multilpe interfaces belonging to one redundancy
+                            # group can't be used to cross the zone.
+                            my @redundant =
+                               grep { $_ }
+                               map  { $_->{redundancy_interfaces} } @interfaces;
+                            @redundant == @interfaces and equal(@redundant)
+                                or last;
+                        }
+                        $intf_ok++;
+                    }
+                    if ($intf_ok == @{ $hardware->{interfaces} }) {
+                        $acl_info->{filter_any_src} = 1;
+                    }
+                }
             }
+
+            # Outgoing ACL
+            else {
+                $acl_info->{rules} = $hardware->{out_rules} ||= [];
+            }
+
             push @{ $router->{acl_list} }, $acl_info;
+            print_acl_placeholder($acl_name);
 
             # Post-processing for hardware interface
             if ($filter eq 'IOS' || $filter eq 'NX-OS') {
@@ -19035,6 +18436,7 @@ sub print_ezvpn {
         no_nat_set => $no_nat_set,
     };
     push @{ $router->{acl_list} }, $acl_info;
+    print_acl_placeholder($crypto_acl_name);
 
     # Crypto filter ACL.
     $acl_info = {
@@ -19045,6 +18447,7 @@ sub print_ezvpn {
         no_nat_set => $no_nat_set,
     };
     push @{ $router->{acl_list} }, $acl_info;
+    print_acl_placeholder($crypto_filter_name);
 
     # Bind crypto filter ACL to virtual template.
     print "interface Virtual-Template$virtual_interface_number type tunnel\n";
@@ -19076,6 +18479,7 @@ sub print_crypto_acl {
         no_nat_set => $no_nat_set,
     };
     push @{ $router->{acl_list} }, $acl_info;
+    print_acl_placeholder($crypto_acl_name);
     return $crypto_acl_name;
 }
 
@@ -19098,6 +18502,7 @@ sub print_crypto_filter_acl {
         no_nat_set => $no_nat_set,
     };
     push @{ $router->{acl_list} }, $acl_info;
+    print_acl_placeholder($crypto_filter_name);
     return $crypto_filter_name;
 }
 
@@ -19578,7 +18983,7 @@ sub print_interface {
 
 sub print_address {
     my ($obj, $no_nat_set) = @_;
-    return prefix_code(address($obj, $no_nat_set));
+    return full_prefix_code(address($obj, $no_nat_set));
 }
 
 sub print_prt {
@@ -19588,17 +18993,8 @@ sub print_prt {
 
     if ($proto eq 'tcp' or $proto eq 'udp') {
         my ($v1, $v2) = @{ $prt->{range} };
-        if ($v1 == $v2) {
-            push @result, $v1;
-        }
-        elsif ($v1 == 1 and $v2 == 65535) {
-        }
-        else {
-            push @result, "$v1-$v2";
-        }
-        if (my $established = $prt->{established}) {
-            push @result, 'estab';
-        }
+        push @result, "$v1-$v2";
+        push @result, 'estab' if $prt->{established};
     }
     elsif ($proto eq 'icmp') {
         if (defined(my $type = $prt->{type})) {
@@ -19620,6 +19016,7 @@ sub print_acls {
     my $model            = $router->{model};
     my $do_auth          = $model->{do_auth};
     my %opt_addr;
+    my $active_log       = $router->{log};
 
     for my $acl (@$acls) {
         my $no_nat_set = delete $acl->{no_nat_set};
@@ -19627,7 +19024,41 @@ sub print_acls {
             my $rules = $acl->{$what} or next;
             for my $rule (@$rules) {
                 my $new_rule = {};
-                $new_rule->{deny} = 1 if $rule->{deny};
+
+                my $deny = $rule->{deny};
+                $new_rule->{deny} = 1 if $deny;
+
+                # Add code for logging.
+                # This code is machine specific.
+                my $log_code;
+                if ($active_log && (my $log = $rule->{log})) {
+                    for my $tag (@$log) {
+                        if (exists $active_log->{$tag}) {
+                            if (my $modifier = $active_log->{$tag}) {
+                                my $normalized = 
+                                    $model->{log_modifiers}->{$modifier};
+                                if ($normalized eq ':subst') {
+                                    $log_code = $modifier;
+                                }
+                                else {
+                                    $log_code = "log $normalized";
+                                }
+                            }
+                            else {
+                                $log_code = 'log';
+                            }
+                            
+                            # Take first of possibly several matching tags.
+                            last;
+                        }
+                    }
+                }
+                if ($log_code) {
+                    $new_rule->{log} = $log_code;
+                }
+                elsif ($router->{log_deny} && $deny) {
+                    $new_rule->{log} = 'log';
+                }
 
                 my $opt_secondary;
                 if (   $secondary_filter && $rule->{some_non_secondary}
@@ -19720,7 +19151,11 @@ sub print_acls {
         $result->{need_protect} = \@list;
     }
 
-    
+    if ($model->{can_objectgroup}) {
+        if (not $router->{no_group_code}) {
+            $result->{do_objectgroup} = 1;
+        }
+    }
 
     print $fh to_json($result, { pretty => 1, canonical => 1 });
 }
@@ -20040,7 +19475,6 @@ sub init_global_vars {
     %obj2path           = ();
     %key2obj            = ();
     %border2obj2auto    = ();
-    %filter_networks    = ();
     @deleted_rules      = ();
     %unknown2services   = %unknown2unknown = ();
     %supernet_rule_tree = %missing_supernet = ();

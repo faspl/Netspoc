@@ -86,6 +86,11 @@ sub int2ip {
     return sprintf "%vd", pack 'N', $int;
 }
 
+sub complement_32bit {
+    my ($ip) = @_;
+    return ~$ip & 0xffffffff;
+}
+
 # Conversion from netmask to prefix and vice versa.
 {
 
@@ -170,6 +175,35 @@ sub setup_ip_net_relation {
                 my $bignet = $mask_ip_hash{$m}->{$i} or next;
                 $subnet->{up} = $bignet;
             }
+        }
+    }
+
+    # Mark all subnets of supernets marked with {opt_secondary_supernet}.
+    for my $obj (values %$ip_net2obj) {
+        my $up = $obj->{up};
+        while(1) {
+            if (not $up) {
+                $obj->{opt_secondary} = 0;
+                last;
+            }
+            my $opt_secondary = $up->{opt_secondary};
+            if (defined $opt_secondary) {
+                $obj->{opt_secondary} = $opt_secondary;
+                last;
+            }
+            $up = $up->{up};
+        }
+    }
+}
+
+sub mark_supernets_of_need_protect {
+    my ($acl_info) = @_;
+    my $need_protect = $acl_info->{need_protect} or return;
+    for my $interface (@$need_protect) {
+        my $up = $interface->{up};
+        while ($up) {
+            $up->{is_supernet_of_need_protect}->{$interface} = 1;
+            $up = $up->{up};
         }
     }
 }
@@ -558,8 +592,9 @@ sub join_ranges {
 # Add deny and permit rules at device which filters only locally.
 sub add_local_deny_rules {
     my ($acl_info, $router_data) = @_;
-    my ($filter_only, $do_object_group, $network_00, $prt_ip) = 
-        @{$router_data}{qw(filter_only do_object_group network_00 prt_ip)};
+    my ($filter_only, $do_object_group) = 
+        @{$router_data}{qw(filter_only do_object_group)};
+    my ($network_00, $prt_ip) = @{$acl_info}{qw(network_00 prt_ip)};
     my $rules = $acl_info->{rules};
     
     my $src_networks = 
@@ -567,14 +602,14 @@ sub add_local_deny_rules {
 
     if ($do_object_group) {
 
-        # If src and dst are object-group, both are known to be identical.
-        my $group;
         my $group_or_single = sub {
             my ($obj_list) = @_;
             if (1 == @$obj_list) {
                 return $obj_list->[0];
             }
-            elsif ($group) {
+
+            # Reuse object-group at all interfaces.
+            elsif (my $group = $router_data->{filter_only_group}) {
                 return $group;
             }
             else {
@@ -582,6 +617,7 @@ sub add_local_deny_rules {
                 $group = { name => "g$router_data->{obj_group_counter}",
                               elements => map { $_->{name} } @$obj_list };
                 push @{ $acl_info->{object_groups} }, $group;
+                $router_data->{filter_only_group} = $group;
                 return $group;
             }
         };
@@ -728,16 +764,116 @@ sub find_object_groups {
     return;
 }
 
-sub gen_acls {
+sub add_protect_rules {
+    my ($acl_info, $router_data, $has_final_permit) = @_;
+    my $need_protect = $acl_info->{need_protect} or return;
+    my ($network_00, $prt_ip) = @{$acl_info}{qw(network_00 prt_ip)};
+
+    # Add deny rules to protect own interfaces.
+    # If a rule permits traffic to a directly connected network behind
+    # the device, this would accidently permit traffic to an interface
+    # of this device as well.
+
+    # To be added deny rule is needless if there is a rule which
+    # permits any traffic to the interface.
+    # This permit rule can be deleted if there is a permit any any rule.
+    my %no_protect;
+    my %seen;
+    my $changed;
+    for my $rule (@{ $acl_info->{intf_rules} }) {
+        next if $rule->{deny};
+        next if $rule->{src} ne $network_00;
+        next if $rule->{prt} ne $prt_ip;
+        my $dst = $rule->{dst};
+        $no_protect{$dst} = 1 if $dst->{need_protect};
+
+        if ($has_final_permit) {
+            $rule    = undef;
+            $changed = 1;
+        }
+    }
+    if ($changed) {
+        $acl_info->{intf_rules} = [ grep { $_ } @{ $acl_info->{intf_rules} } ];
+    }
+
+    # Deny rule is needless if there is no such permit rule.
+    # Try to optimize this case.
+    my %need_protect;
+    for my $rule (@{ $acl_info->{rules} }) {
+        next if $rule->{deny};
+        next if $rule->{prt}->{established};
+        my $dst = $rule->{dst};
+        my $hash = $dst->{is_supernet_of_need_protect} or next;
+        for my $intf (@$need_protect) {
+            if ($hash->{$intf}) {
+                $need_protect{$intf} = $intf;
+            }
+        }
+    }
+
+    # Protect own interfaces.
+    for my $interface (@$need_protect) {
+        if (    $no_protect{$interface}
+            and not $need_protect{$interface}
+            and not $has_final_permit)
+        {
+            next;
+        }
+
+        push @{ $acl_info->{intf_rules} }, {
+            deny => 1,
+            src  => $network_00,
+            dst  => $interface,
+            prt  => $prt_ip
+        };
+    }
+}
+
+# Check if last is rule is 'permit ip any any'.
+sub check_final_permit {
+    my ($acl_info, $router_data) = @_;
+    my $rules = $acl_info->{rules};
+    @$rules or return;
+    my ($net_00, $prt_ip) = @{$acl_info}{qw(network_00 prt_ip)};
+    my ($deny, $src, $dst, $prt) = @{ $rules->[-1] }{qw(deny src dst prt)};
+    return !$deny && $src eq $net_00 && $dst eq $net_00 && $prt eq $prt_ip;
+}
+
+# Add 'deny|permit ip any any' at end of ACL.
+sub add_final_permit_deny_rule {
+    my ($acl_info, $router_data) = @_;
+    my $rules = $acl_info->{rules};
+    $acl_info->{add_deny} or $acl_info->{add_permit} or return;
+
+    my ($net_00, $prt_ip) = @{$acl_info}{qw(network_00 prt_ip)};
+    my $rule = { src => $net_00, dst => $net_00, prt => $prt_ip };
+    $rule->{deny} = 1 if $acl_info->{add_deny};
+    push @{ $acl_info->{rules} }, $rule;
+
+    return;
+}
+
+sub prepare_acls {
     my ($path) = @_;
     my $router_data = from_json(read_file($path));
-    my ($model, $acls, $opt_secondary, $filter_only, $need_protect, 
-        $do_object_group) = 
-        @{$router_data}
-    {qw(model acls opt_secondary filter_only need_protect do_object_group)};
+    my ($model, $acls, $filter_only, $do_object_group) =
+        @{$router_data}{qw(model acls filter_only do_object_group)};
     
+    # Reuse identical groups from different ACLs.
+    my $obj_groups_hash = {};
+
     my $ip_net2obj = {};
     my $prt2obj    = {};
+
+    if ($filter_only) {
+        for my $ip_net (@$filter_only) {
+            my $obj = $ip_net2obj->{$ip_net} ||= create_ip_obj($ip_net);
+
+            # Update original array.
+            $ip_net = $obj;
+        }
+    }
+            
     for my $acl_info (@$acls) {
         for my $what (qw(intf_rules rules)) {
             my $rules = $acl_info->{$what} or next;
@@ -754,18 +890,28 @@ sub gen_acls {
                 }
             }
         }
-    }
+        if (my $opt_secondary = $acl_info->{opt_secondary}) {
+            for my $ip_net (@$opt_secondary) {
+                my $obj = $ip_net2obj->{$ip_net} ||= create_ip_obj($ip_net);
+                $obj->{opt_secondary} = $obj;
+                $ip_net = $obj;
+            }
+        }
+        if (my $need_protect = $acl_info->{need_protect}) {
+            for my $ip_net (@$need_protect) {
+                my $obj = $ip_net2obj->{$ip_net} ||= create_ip_obj($ip_net);
+                $obj->{need_protect} = 1;
+                $ip_net = $obj;
+            }
+        }
 
-    setup_ip_net_relation($ip_net2obj);
-    $router_data->{network_00} = $ip_net2obj->{'0.0.0.0/0'};
-
-    my $prt_hash = setup_prt_relation($prt2obj);
-    my $prt_ip = $router_data->{prt_ip} = $prt2obj->{ip};
-
-    # Reuse identical groups.
-    my $obj_groups_hash   = {};
-
-    for my $acl_info (@$acls) {
+        setup_ip_net_relation($ip_net2obj);
+        $acl_info->{network_00} = $ip_net2obj->{'0.0.0.0/0'};
+        mark_supernets_of_need_protect($acl_info);
+        
+        my $prt_hash = setup_prt_relation($prt2obj);
+        my $prt_ip = $acl_info->{prt_ip} = $prt2obj->{ip};
+        
         for my $what (qw(intf_rules rules)) {
             my $rules = $acl_info->{$what} or next;
             if ($model eq 'Linux') {
@@ -781,15 +927,18 @@ sub gen_acls {
             }
             $acl_info->{$what} = $rules;
         }
+
+        my $has_final_permit = check_final_permit($acl_info, $router_data);
+        add_protect_rules($acl_info, $router_data, 
+                          $has_final_permit || $acl_info->{add_permit});
         if ($do_object_group) {
             find_object_groups($acl_info, $obj_groups_hash);
         }
-
         if ($filter_only) {
             add_local_deny_rules($acl_info, $router_data);
         }
-        if ($need_protect) {
-            add_protect_rules($acl_info, $model, $need_protect);
+        elsif (not $has_final_permit) {
+            add_final_permit_deny_rule($acl_info, $router_data);
         }
     }
     return $router_data;
@@ -821,7 +970,7 @@ sub cisco_acl_addr {
 
             # Inverse mask bits.
             $mask = complement_32bit($mask) if $model =~ /^(:?NX-OS|IOS)/;
-            my $mask_code = print_ip($mask);
+            my $mask_code = int2ip($mask);
             return "$ip $mask_code";
         }
     }
@@ -859,11 +1008,139 @@ sub print_object_groups {
     }
 }
 
-sub print_acl_lines {
+# Returns 3 values for building a Cisco ACL:
+# permit <val1> <src> <val2> <dst> <val3>
+sub cisco_prt_code {
+    my ($src_range, $prt, $model) = @_;
+    my $proto = $prt->{proto};
+
+    if ($proto eq 'ip') {
+        return ('ip', undef, undef);
+    }
+    elsif ($proto eq 'tcp' or $proto eq 'udp') {
+        my $port_code = sub {
+            my ($range_obj) = @_;
+            my ($v1, $v2) = @{ $range_obj->{range} };
+            if ($v1 == $v2) {
+                return ("eq $v1");
+            }
+            elsif ($v1 == 1 and $v2 == 65535) {
+                return (undef);
+            }
+            elsif ($v2 == 65535) {
+                return 'gt ' . ($v1 - 1);
+            }
+            elsif ($v1 == 1) {
+                return 'lt ' . ($v2 + 1);
+            }
+            else {
+                return ("range $v1 $v2");
+            }
+        };
+        my $dst_prt = $port_code->($prt);
+        if (my $established = $prt->{established}) {
+            if (defined $dst_prt) {
+                $dst_prt .= ' established';
+            }
+            else {
+                $dst_prt = 'established';
+            }
+        }
+        my $src_prt = $src_range && $port_code->($src_range);
+        return ($proto, $src_prt, $dst_prt);
+    }
+    elsif ($proto eq 'icmp') {
+        if (defined(my $type = $prt->{type})) {
+            if (defined(my $code = $prt->{code})) {
+                if ($model->{no_filter_icmp_code}) {
+
+                    # PIX can't handle the ICMP code field.
+                    # If we try to permit e.g. "port unreachable",
+                    # "unreachable any" could pass the PIX.
+                    return ($proto, undef, $type);
+                }
+                else {
+                    return ($proto, undef, "$type $code");
+                }
+            }
+            else {
+                return ($proto, undef, $type);
+            }
+        }
+        else {
+            return ($proto, undef, undef);
+        }
+    }
+    else {
+        return ($proto, undef, undef);
+    }
+}
+
+sub print_cisco_acl {
+    my ($acl_info, $model) = @_;
+    my $intf_rules = $acl_info->{intf_rules} || [];
+    my $rules = $acl_info->{rules};
+    my $name = $acl_info->{name};
+    my $numbered = 10;
+    my $prefix;
+    if ($model eq 'IOS') {
+        $prefix = '';
+        print "ip access-list extended $name\n";
+    }
+    elsif ($model eq 'NX-OS') {
+        $prefix = '';
+        print "ip access-list $name\n";
+    }
+    elsif ($model eq 'ASA' || $model eq 'ACE') {
+        $prefix = "access-list $name extended";
+    }
+    elsif ($model eq 'PIX') {
+        $prefix = "access-list $name";
+    }
+    else {
+        fatal_err("Unexpected model $model");
+    }
+
+    for my $rule (@$intf_rules, @$rules) {
+        my ($deny, $src, $dst, $src_range, $prt) =
+          @{$rule}{qw(deny src dst src_range prt)};
+        my $action = $deny ? 'deny' : 'permit';
+        my $skey = $src->{name};
+        my $dkey = $dst->{name};
+
+        my ($proto_code, $src_port_code, $dst_port_code) =
+          cisco_prt_code($src_range, $prt, $model);
+        my $result = "$prefix $action $proto_code";
+        $result .= ' ' . cisco_acl_addr($skey, $model);
+        $result .= " $src_port_code" if defined $src_port_code;
+        $result .= ' ' . cisco_acl_addr($dkey, $model);
+        $result .= " $dst_port_code" if defined $dst_port_code;
+
+        if (my $log = $rule->{log}) {
+            $result .= " $log";
+        }
+
+        # Add line numbers.
+        if ($model eq 'NX-OS') {
+            $result = " $numbered$result";
+            $numbered += 10;
+        }
+        print "$result\n";
+    }
+    return;
+}
+
+sub print_acl {
     my ($acl_info, $model) = @_;
 
-    if (my $groups = $acl_info->{object_group}) {
-        print_object_groups($groups, $model);
+    if ($model eq 'Linux') {
+        print_iptables_acl($acl_info);
+    }
+    else {
+        if (my $groups = $acl_info->{object_groups}) {
+            print_object_groups($groups, $model);
+        }    
+        print_cisco_acl($acl_info, $model);
     }
 }
 
@@ -886,7 +1163,7 @@ sub print_combined {
         if (my ($acl_name) = ($line =~ /^#insert (.*)\n$/)) {
             my $acl_info = $acl_hash{$acl_name} or 
                 fatal_err("Unexpected ACL $acl_name");
-            print_acl_lines($acl_info, $model);
+            print_acl($acl_info, $model);
         }
 
         # Print unchanged config line.
@@ -906,7 +1183,7 @@ sub pass2 {
     my ($args) = @_;
     my ($rules_path, $config_path, $out_path, @extra) = @$args;
     ($rules_path && $config_path && $out_path || @extra) or pod2usage(2);
-    my $router_data = gen_acls($rules_path);
+    my $router_data = prepare_acls($rules_path);
     my $config = read_file_lines($config_path);
     print_combined($config, $router_data, $out_path);
 }

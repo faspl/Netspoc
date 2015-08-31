@@ -16251,74 +16251,6 @@ sub full_prefix_code {
     return "$ip_code/$prefix_code";
 }
 
-# Returns 3 values for building a Cisco ACL:
-# permit <val1> <src> <val2> <dst> <val3>
-sub cisco_prt_code {
-    my ($src_range, $prt, $model) = @_;
-    my $proto = $prt->{proto};
-
-    if ($proto eq 'ip') {
-        return ('ip', undef, undef);
-    }
-    elsif ($proto eq 'tcp' or $proto eq 'udp') {
-        my $port_code = sub {
-            my ($range_obj) = @_;
-            my ($v1, $v2) = @{ $range_obj->{range} };
-            if ($v1 == $v2) {
-                return ("eq $v1");
-            }
-            elsif ($v1 == 1 and $v2 == 65535) {
-                return (undef);
-            }
-            elsif ($v2 == 65535) {
-                return 'gt ' . ($v1 - 1);
-            }
-            elsif ($v1 == 1) {
-                return 'lt ' . ($v2 + 1);
-            }
-            else {
-                return ("range $v1 $v2");
-            }
-        };
-        my $dst_prt = $port_code->($prt);
-        if (my $established = $prt->{established}) {
-            if (defined $dst_prt) {
-                $dst_prt .= ' established';
-            }
-            else {
-                $dst_prt = 'established';
-            }
-        }
-        my $src_prt = $src_range && $port_code->($src_range);
-        return ($proto, $src_prt, $dst_prt);
-    }
-    elsif ($proto eq 'icmp') {
-        if (defined(my $type = $prt->{type})) {
-            if (defined(my $code = $prt->{code})) {
-                if ($model->{no_filter_icmp_code}) {
-
-                    # PIX can't handle the ICMP code field.
-                    # If we try to permit e.g. "port unreachable",
-                    # "unreachable any" could pass the PIX.
-                    return ($proto, undef, $type);
-                }
-                else {
-                    return ($proto, undef, "$type $code");
-                }
-            }
-            else {
-                return ($proto, undef, $type);
-            }
-        }
-        else {
-            return ($proto, undef, undef);
-        }
-    }
-    else {
-        return ($proto, undef, undef);
-    }
-}
-
 # Returns iptables code for filtering a protocol.
 sub iptables_prt_code {
     my ($src_range, $prt) = @_;
@@ -16372,307 +16304,6 @@ sub iptables_prt_code {
     }
 }
 
-sub cisco_acl_line {
-    my ($router, $rules_aref, $no_nat_set, $prefix) = @_;
-    my $model       = $router->{model};
-    my $filter_type = $model->{filter};
-    $filter_type =~ /^(:?IOS|NX-OS|PIX|ACE)$/
-      or internal_err("Unknown filter_type $filter_type");
-    my $numbered   = 10;
-    my $active_log = $router->{log};
-    for my $rule (@$rules_aref) {
-        my ($deny, $src, $dst, $src_range, $prt) =
-          @{$rule}{qw(deny src dst src_range prt)};
-        my $action = $deny ? 'deny' : 'permit';
-        my $spair = address($src, $no_nat_set);
-        my $dpair = address($dst, $no_nat_set);
-
-        my ($proto_code, $src_port_code, $dst_port_code) =
-          cisco_prt_code($src_range, $prt, $model);
-        my $result = "$prefix $action $proto_code";
-        $result .= ' ' . cisco_acl_addr($spair, $model);
-        $result .= " $src_port_code" if defined $src_port_code;
-        $result .= ' ' . cisco_acl_addr($dpair, $model);
-        $result .= " $dst_port_code" if defined $dst_port_code;
-
-        # Find code for logging.
-        my $log_code;
-        if ($active_log && (my $log = $rule->{log})) {
-            for my $tag (@$log) {
-                if (exists $active_log->{$tag}) {
-                    if (my $modifier = $active_log->{$tag}) {
-                        my $normalized = $model->{log_modifiers}->{$modifier};
-                        if ($normalized eq ':subst') {
-                            $log_code = $modifier;
-                        }
-                        else {
-                            $log_code = "log $normalized";
-                        }
-                    }
-                    else {
-                        $log_code = 'log';
-                    }
-
-                    # Take first of possibly several matching tags.
-                    last;
-                }
-            }
-        }
-        if ($log_code) {
-            $result .= " $log_code";
-        }
-        elsif ($router->{log_deny} && $deny) {
-            $result .= " log";
-        }
-
-        # Add line numbers.
-        if ($filter_type eq 'NX-OS') {
-            $result = " $numbered$result";
-            $numbered += 10;
-        }
-        print "$result\n";
-    }
-    return;
-}
-
-my $min_object_group_size = 2;
-
-sub find_object_groups {
-    my ($router, $hardware) = @_;
-    my $model       = $router->{model};
-    my $filter_type = $model->{filter};
-    my $active_log  = $router->{log};
-    my $keyword =
-      $filter_type eq 'NX-OS'
-      ? 'object-group ip address'
-      : 'object-group network';
-
-    # Find identical groups of same size.
-    my $size2first2group_hash = ($router->{size2first2group_hash} ||= {});
-    $router->{vrf_shared_data}->{obj_group_counter} ||= 0;
-
-    # Leave 'intf_rules' untouched, because they are handled
-    # indivually for ASA, PIX.
-    # NX-OS needs them indivually when optimizing need_protect.
-    for my $rule_type ('rules', 'out_rules') {
-        next if not $hardware->{$rule_type};
-
-        # Find object-groups in src / dst of rules.
-        for my $this ('src', 'dst') {
-            my $that = $this eq 'src' ? 'dst' : 'src';
-            my %group_rule_tree;
-
-            # Find groups of rules with identical
-            # deny, src_range, prt, log, src/dst and different dst/src.
-            for my $rule (@{ $hardware->{$rule_type} }) {
-                my $deny      = $rule->{deny} || '';
-                my $that      = $rule->{$that};
-                my $this      = $rule->{$this};
-                my $src_range = $rule->{src_range} || '';
-                my $prt       = $rule->{prt};
-                my $key       = "$deny,$that,$src_range,$prt";
-                if (my $log = $rule->{log}) {
-                    for my $tag (@$log) {
-                        if (defined(my $type = $active_log->{$tag})) {
-                            $key .= ",$type";
-                            last;
-                        }
-                    }
-                }
-                $group_rule_tree{$key}->{$this} = $rule;
-            }
-
-            # Find groups >= $min_object_group_size,
-            # mark rules belonging to one group,
-            # put groups into an array / hash.
-            for my $href (values %group_rule_tree) {
-
-                # $href is {dst/src => rule, ...}
-                my $size = keys %$href;
-                if ($size >= $min_object_group_size) {
-                    my $glue = {
-
-                        # Indicator, that no further rules need
-                        # to be processed.
-                        active => 0,
-
-                        # NAT map for address calculation.
-                        no_nat_set => $hardware->{no_nat_set},
-
-                        # object-ref => rule, ...
-                        hash => $href
-                    };
-
-                    # All this rules have identical
-                    # deny, src_range, prt and dst/src
-                    # and shall be replaced by a single new rule
-                    # referencing an object group.
-                    for my $rule (values %$href) {
-                        $rule->{group_glue} = $glue;
-                    }
-                }
-            }
-
-            my $calc_ip_mask_strings = sub {
-                my ($keys, $no_nat_set) = @_;
-                return (
-                    map { join('/', @$_) }
-                    sort { $a->[0] <=> $b->[0] || $a->[1] <=> $b->[1] }
-                    map { address($_, $no_nat_set) }
-                    map { $ref2obj{$_} || internal_err($_) } @$keys
-                );
-            };
-
-            my $build_group = sub {
-                my ($ip_mask_strings) = @_;
-                my $counter = $router->{vrf_shared_data}->{obj_group_counter}++;
-
-                my $group = new(
-                    'Objectgroup',
-                    name     => "g$counter",
-                    elements => $ip_mask_strings,
-                    hash     => { map { $_ => 1 } @$ip_mask_strings },
-                );
-
-                # Print object-group.
-                my $numbered = 10;
-                print "$keyword $group->{name}\n";
-                for my $ip_mask (@$ip_mask_strings) {
-                    my $pair = [ split '/', $ip_mask ];
-
-                    # Reject network with mask = 0 in group.
-                    # This occurs if optimization didn't work correctly.
-                    $pair->[1] == 0
-                      and internal_err(
-                        "Unexpected object with mask 0",
-                        " in object-group of $router->{name}"
-                      );
-                    my $adr = cisco_acl_addr($pair, $model);
-                    if ($filter_type eq 'NX-OS') {
-                        print " $numbered $adr\n";
-                        $numbered += 10;
-                    }
-                    elsif ($filter_type eq 'ACE') {
-                        print " $adr\n";
-                    }
-                    else {
-                        print " network-object $adr\n";
-                    }
-                }
-                return $group;
-            };
-
-            # Find group with identical elements or define a new one.
-            my $get_group = sub {
-                my ($glue)     = @_;
-                my $hash       = $glue->{hash};
-                my $no_nat_set = $glue->{no_nat_set};
-
-                # Keys are sorted by their internal address to get
-                # some "first" element.
-                # This element is useable for hashing, because addresses
-                # are known to be fix during program execution.
-                my @keys  = sort keys %$hash;
-                my $first = $keys[0];
-                my $size  = @keys;
-
-                # Find group with identical elements.
-              HASH:
-                for my $group_hash (
-                    @{ $size2first2group_hash->{$size}->{$first} })
-                {
-                    my $href = $group_hash->{hash};
-
-                    # Check elements for equality.
-                    for my $key (@keys) {
-                        $href->{$key} or next HASH;
-                    }
-
-                    # Found $group_hash with matching elements.
-                    # Check for existing group in current NAT domain.
-                    my $nat2group = $group_hash->{nat2group};
-                    if (my $group = $nat2group->{$no_nat_set}) {
-                        return $group;
-                    }
-
-                    my @ip_mask_strings =
-                      $calc_ip_mask_strings->(\@keys, $no_nat_set);
-
-                    # Check for matching group in other NAT domains.
-                  GROUP:
-                    for my $group (values %$nat2group) {
-                        my $href = $group->{hash};
-
-                        # Check NATed addresses for equality.
-                        for my $key (@ip_mask_strings) {
-                            $href->{$key} or next GROUP;
-                        }
-
-                        # Found matching group.
-                        $nat2group->{$no_nat_set} = $group;
-                        return $group;
-                    }
-
-                    # No group found, build new group.
-                    my $group = $build_group->(\@ip_mask_strings);
-                    $nat2group->{$no_nat_set} = $group;
-                    return $group;
-                }
-
-                # No group hash found, build new group hash with new group.
-                my @ip_mask_strings =
-                  $calc_ip_mask_strings->(\@keys, $no_nat_set);
-                my $group      = $build_group->(\@ip_mask_strings);
-                my $group_hash = {
-                    hash      => $hash,
-                    nat2group => { $no_nat_set => $group },
-                };
-                push(
-                    @{ $size2first2group_hash->{$size}->{$first} },
-                    $group_hash
-                );
-                return $group;
-            };
-
-            # Build new list of rules using object groups.
-            my @new_rules;
-            for my $rule (@{ $hardware->{$rule_type} }) {
-
-                # Remove tag, otherwise call to find_object_groups
-                # for another router would become confused.
-                if (my $glue = delete $rule->{group_glue}) {
-
-#              debug(print_rule $rule);
-                    if ($glue->{active}) {
-
-#                 debug(" deleted: $glue->{group}->{name}");
-                        next;
-                    }
-                    my $group = $get_group->($glue);
-
-#              debug(" generated: $group->{name}");
-#              # Only needed when debugging.
-#              $glue->{group} = $group;
-
-                    $glue->{active} = 1;
-                    my ($deny, $srcdst, $src_range, $prt, $log) =
-                      @{$rule}{ 'deny', $that, 'src_range', 'prt', 'log' };
-                    $rule = {
-                        $that => $srcdst,
-                        $this => $group,
-                        prt   => $prt
-                    };
-                    $rule->{deny}      = $deny      if $deny;
-                    $rule->{src_range} = $src_range if $src_range;
-                    $rule->{log}       = $log       if $log;
-                }
-                push @new_rules, $rule;
-            }
-            $hardware->{$rule_type} = \@new_rules;
-        }
-    }
-    return;
-}
 
 # Handle iptables.
 #
@@ -17560,206 +17191,6 @@ sub print_chains {
 
 my $deny_any_rule;
 
-sub print_cisco_acl_add_deny {
-    my ($router, $hardware, $no_nat_set, $model, $prefix) = @_;
-    my $permit_any;
-
-    my $rules = $hardware->{rules} ||= [];
-    if (@$rules) {
-        my ($deny, $src, $dst, $prt) =
-          @{ $rules->[-1] }{ 'deny', 'src', 'dst', 'prt' };
-        $permit_any =
-             !$deny
-          && is_network($src)
-          && $src->{mask} == 0
-          && is_network($dst)
-          && $dst->{mask} == 0
-          && $prt eq $prt_ip;
-    }
-
-    # Add permit or deny rule at end of ACL
-    # unless the previous rule is 'permit ip any any'.
-    if (!$permit_any) {
-        push(
-            @{ $hardware->{rules} },
-            $hardware->{no_in_acl} ? $permit_any_rule : $deny_any_rule
-        );
-        $permit_any = $hardware->{no_in_acl};
-    }
-
-    if (
-        $router->{need_protect}
-        ||
-
-        # ASA protects IOS router behind crosslink interface.
-        $router->{crosslink_intf_hash}
-      )
-    {
-
-        # Routers connected by crosslink networks are handled like one
-        # large router. Protect the collected interfaces of the whole
-        # cluster at each entry.
-        my $interfaces = $router->{crosslink_interfaces};
-        if (!$interfaces) {
-            $interfaces = $router->{interfaces};
-            if ($model->{has_vip}) {
-                $interfaces = [ grep { !$_->{vip} } @$interfaces ];
-            }
-        }
-
-        # Set crosslink_intf_hash even for routers not part of a
-        # crosslink cluster.
-        $router->{crosslink_intf_hash} ||=
-          { map { $_ => $_ } @{ $router->{interfaces} } };
-        my $intf_hash = $router->{crosslink_intf_hash};
-
-        # Add deny rules to protect own interfaces.
-        # If a rule permits traffic to a directly connected network
-        # behind the device, this would accidently permit traffic
-        # to an interface of this device as well.
-
-        # Deny rule is needless if there is a rule which permits any
-        # traffic to the interface or
-        # to one interface of a redundancy group.
-        # The permit rule can be deleted if there is a permit any any rule.
-        my %no_protect;
-        my %seen;
-        my $changed;
-        for my $rule (@{ $hardware->{intf_rules} }) {
-            next if $rule->{deny};
-            my $src = $rule->{src};
-            next if not is_network($src);
-            next if $src->{mask} != 0;
-            next if $rule->{prt} ne $prt_ip;
-            my $dst = $rule->{dst};
-            $no_protect{$dst} = 1 if $intf_hash->{$dst};
-            $seen{ $dst->{redundancy_interfaces} }++
-              if $dst->{redundancy_interfaces};
-
-            if ($permit_any) {
-                $rule    = undef;
-                $changed = 1;
-            }
-        }
-        if ($changed) {
-            $hardware->{intf_rules} =
-              [ grep { defined $_ } @{ $hardware->{intf_rules} } ];
-        }
-
-        # Deny rule is needless if there is no such permit rule.
-        # Try to optimize this case.
-        my %need_protect;
-        my $protect_all;
-        my $local_filter = $router->{managed} =~ /^local/;
-        my $check_intf   = sub {
-            my ($ip, $mask) = @_;
-            for my $intf (values %$intf_hash) {
-                next
-                  if $intf->{ip} =~ /^(unnumbered|negotiated|tunnel|bridged)$/;
-                my $i = address($intf, $no_nat_set)->[0];
-                if (match_ip($i, $ip, $mask)) {
-                    $need_protect{$intf} = $intf;
-
-#                   debug("Protect $intf->{name} at $hardware->{name}");
-                }
-            }
-        };
-      RULE:
-        for my $rule (@{ $hardware->{rules} }) {
-            next if $rule->{deny};
-            next if $rule->{prt}->{established};
-
-            # Ignore permit_any_rule of local filter.
-            # Some other permit_any_rule from a real service
-            # wouldn't match.
-            next if $local_filter && $rule eq $permit_any_rule;
-            my $dst = $rule->{dst};
-
-            # We only need to check networks:
-            # - subnet/host and interface already have been checked to
-            #   have disjoint ip addresses to interfaces of current router.
-            if (is_objectgroup($dst)) {
-                my $elements = $dst->{elements};
-                for my $ip_mask (@$elements) {
-                    my ($ip, $mask) = split '/', $ip_mask;
-                    next if $mask == 0xffffffff;
-                    $check_intf->($ip, $mask);
-                }
-            }
-            elsif (is_network($dst)) {
-                if ($dst->{mask} == 0) {
-                    $protect_all = 1;
-
-#                   debug("Protect all $router->{name}: $hardware->{name}");
-                    last RULE;
-                }
-
-                my ($ip, $mask) = @{ address($dst, $no_nat_set) };
-                $check_intf->($ip, $mask);
-            }
-        }
-
-        for my $interface (@$interfaces) {
-            if (
-                $no_protect{$interface}
-                or not $protect_all
-                and not $need_protect{$interface}
-
-                # Interface with 'no_in_acl' gets 'permit any any' added
-                # and hence needs deny rules.
-                and not $hardware->{no_in_acl}
-              )
-            {
-                next;
-            }
-
-            # Ignore 'unnumbered' interfaces.
-            if ($interface->{ip} =~
-                /^(?:unnumbered|negotiated|tunnel|bridged)$/)
-            {
-                next;
-            }
-            internal_err("Managed router has short $interface->{name}")
-              if $interface->{ip} eq 'short';
-
-            # IP of other interface may be unknown if dynamic NAT is used.
-            if ($interface->{hardware} ne $hardware) {
-                my $nat_network =
-                  get_nat_network($interface->{network}, $no_nat_set);
-                next if $nat_network->{dynamic};
-            }
-            if (    $interface->{redundancy_interfaces}
-                and $seen{ $interface->{redundancy_interfaces} }++)
-            {
-                next;
-            }
-
-            # Protect own interfaces.
-            push @{ $hardware->{intf_rules} },
-              {
-                deny => 1,
-                src  => $network_00,
-                dst  => $interface,
-                prt  => $prt_ip
-              };
-        }
-        if ($hardware->{crosslink}) {
-            $hardware->{intf_rules} = [];
-        }
-    }
-
-    # ASA and PIX ignore rules for own interfaces.
-    else {
-        $hardware->{intf_rules} = [];
-    }
-
-    # Concatenate interface rules and ordinary rules.
-    my $intf_rules = $hardware->{intf_rules};
-    my $all_rules = @$intf_rules ? [ @$intf_rules, @$rules ] : $rules;
-    cisco_acl_line($router, $all_rules, $no_nat_set, $prefix);
-    return;
-}
-
 sub print_acl_placeholder {
     my ($acl_name) = @_;
     print "#insert $acl_name\n";
@@ -18263,7 +17694,6 @@ sub print_cisco_acls {
             my $acl_name = "$hardware->{name}_$suffix";
             my $acl_info = {
                 name => $acl_name,
-                add_deny => 1,
                 no_nat_set => $no_nat_set,
             };
 
@@ -18275,6 +17705,12 @@ sub print_cisco_acls {
                 $acl_info->{intf_rules} = $hardware->{intf_rules};
                 if ($router->{need_protect}) {
                     $acl_info->{protect_self} = 1;
+                }
+                if ($hardware->{no_in_acl}) {
+                    $acl_info->{add_permit} = 1;
+                }
+                else {
+                    $acl_info->{add_deny} = 1;
                 }
 
                 if ($managed_local) {
@@ -18313,6 +17749,8 @@ sub print_cisco_acls {
             # Outgoing ACL
             else {
                 $acl_info->{rules} = $hardware->{out_rules} ||= [];
+                $acl_info->{add_deny} = 1;
+
             }
 
             push @{ $router->{acl_list} }, $acl_info;
@@ -18335,6 +17773,9 @@ sub print_cisco_acls {
                 print "access-group $acl_name $suffix interface",
                   " $hardware->{name}\n";
             }
+
+            # Empty line after each ACL.
+            print "\n";
         }
     }
     return;
@@ -19017,9 +18458,46 @@ sub print_acls {
     my $do_auth          = $model->{do_auth};
     my %opt_addr;
     my $active_log       = $router->{log};
+    my $need_protect;
+
+    # Collect interfaces that need protection by additional deny rules.
+    # Add list to each ACL separately, because IP may be changed by NAT.
+    if (
+        $router->{need_protect}
+        ||
+
+        # ASA protects IOS router behind crosslink interface.
+        $router->{crosslink_interfaces}
+      )
+    {
+
+        # Routers connected by crosslink networks are handled like one
+        # large router. Protect the collected interfaces of the whole
+        # cluster at each entry.
+        $need_protect = $router->{crosslink_interfaces};
+        if (!$need_protect) {
+            $need_protect = $router->{interfaces};
+            $need_protect = [ 
+                grep({ $_->{ip} !~ /^(?:unnumbered|negotiated|tunnel|bridged)$/ } 
+                     @$need_protect) ];
+            if ($model->{has_vip}) {
+                $need_protect = [ grep { !$_->{vip} } @$need_protect ];
+            }
+        }
+    }
 
     for my $acl (@$acls) {
         my $no_nat_set = delete $acl->{no_nat_set};
+
+        if ($need_protect) {
+            $acl->{need_protect} = [
+
+                # Remove duplicate addresses from redundancy interfaces.
+                unique
+                map({ full_prefix_code(address($_, $no_nat_set)) }
+                    @$need_protect) ];
+        }
+
         for my $what (qw(intf_rules rules)) {
             my $rules = $acl->{$what} or next;
             for my $rule (@$rules) {
@@ -19065,46 +18543,51 @@ sub print_acls {
                     || $standard_filter && $rule->{some_primary})
                 {
                     $opt_secondary = 1;
+
+                    for my $where (qw(src dst)) {
+                        my $obj = $rule->{$where};
+
+                        # Prepare secondary optimization.
+                        my $type = ref($obj);
+
+                        # Restrict secondary optimization at
+                        # authenticating router to prevent
+                        # unauthorized access with spoofed IP
+                        # address.
+                        if ($do_auth) {
+
+                            # Single ID-hosts must not be converted to
+                            # network.
+                            if ($type eq 'Subnet') {
+                                next if $obj->{id};
+                            }
+
+                            # Network with ID-hosts must not be
+                            # optimized at all.
+                            if ($obj->{has_id_hosts}) {
+                                $opt_secondary = undef;
+                                last;
+                            }
+                        }
+
+                        if ($type eq 'Subnet' or $type eq 'Interface') {
+                            my $net = $obj->{network};
+                            next if $net->{has_other_subnet};
+                            $obj = $net;
+                        }
+                        if (my $max = $obj->{max_secondary_net}) {
+                            $obj = $max;
+                        }
+                        my $addr = print_address($obj, $no_nat_set);
+                        $opt_addr{$addr} = 1;
+                    }
+                    $new_rule->{opt_secondary} = 1 if $opt_secondary;
                 }
 
                 for my $where (qw(src dst)) {
                     my $obj = $rule->{$where};
                     $new_rule->{$where} = print_address($obj, $no_nat_set);
-
-                    # Prepare secondary optimization.
-                    my $type = ref($obj);
-
-                    # Restrict secondary optimization at
-                    # authenticating router to prevent
-                    # unauthorized access with spoofed IP
-                    # address.
-                    if ($do_auth) {
-
-                        # Single ID-hosts must not be converted to
-                        # network.
-                        if ($type eq 'Subnet') {
-                            next if $obj->{id};
-                        }
-
-                        # Network with ID-hosts must not be optimized at all.
-                        if ($obj->{has_id_hosts}) {
-                            $opt_secondary = undef;
-                        }
-                    }
-
-                    if ($type eq 'Subnet' or $type eq 'Interface') {
-                        my $net = $obj->{network};
-                        next if $net->{has_other_subnet};
-                        $obj = $net;
-                    }
-                    if (my $max = $obj->{max_secondary_net}) {
-                        $obj = $max;
-                    }
-                    my $addr = print_address($obj, $no_nat_set);
-                    $opt_addr{$addr} = 1;
                 }
-                $new_rule->{opt_secondary} = 1 if $opt_secondary;
-
                 for my $where (qw(src_range prt)) {
                     my $prt = $rule->{$where} or next;
                     $new_rule->{$where} = print_prt($prt);
@@ -19112,43 +18595,18 @@ sub print_acls {
                 $rule = $new_rule;
             }
         }
+
+        if (keys %opt_addr) {
+            $acl->{opt_secondary} = [ sort keys %opt_addr ];
+        }        
+
     }
 
-    my $result = { model => $model->{name}, acls  => $acls, };
-
-    if (keys %opt_addr) {
-        $result->{opt_secondary} = [ sort keys %opt_addr ];
-    }        
+    my $result = { model => $model->{class}, acls  => $acls, };
 
     if (my $filter_only = $router->{filter_only}) {
         my @list = map { prefix_code($_) } @$filter_only;
         $result->{filter_only} = \@list;
-    }
-
-    if (
-        $router->{need_protect}
-        ||
-
-        # ASA protects IOS router behind crosslink interface.
-        $router->{crosslink_interfaces}
-      )
-    {
-
-        # Routers connected by crosslink networks are handled like one
-        # large router. Protect the collected interfaces of the whole
-        # cluster at each entry.
-        my $interfaces = $router->{crosslink_interfaces};
-        if (!$interfaces) {
-            $interfaces = $router->{interfaces};
-            $interfaces = [ 
-                grep({ $_->{ip} !~ /^(?:unnumbered|negotiated|tunnel|bridged)$/ } 
-                     @$interfaces) ];
-            if ($model->{has_vip}) {
-                $interfaces = [ grep { !$_->{vip} } @$interfaces ];
-            }
-        }
-        my @list = map { prefix_code(address($_, undef)) } @$interfaces;
-        $result->{need_protect} = \@list;
     }
 
     if ($model->{can_objectgroup}) {

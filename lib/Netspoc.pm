@@ -17626,7 +17626,7 @@ sub print_iptables_acls {
         my $intf_acl_name = "${in_hw}_self";
         my $acl_info = {
             name => $intf_acl_name,
-            rules => $hardware->{intf_rules},
+            rules => $hardware->{intf_rules} || [],
             add_deny => 1,
             no_nat_set => $no_nat_set,
         };
@@ -17702,8 +17702,8 @@ sub print_cisco_acls {
             # - set {filter_any_src}.
             if ($suffix eq 'in') {
                 $acl_info->{rules} = $hardware->{rules};
-                $acl_info->{intf_rules} = $hardware->{intf_rules};
                 if ($router->{need_protect}) {
+                    $acl_info->{intf_rules} = $hardware->{intf_rules};
                     $acl_info->{protect_self} = 1;
                 }
                 if ($hardware->{no_in_acl}) {
@@ -18450,8 +18450,7 @@ sub print_prt {
 
 sub print_acls {
     my ($router, $acls, $fh) = @_;
-    @$acls or return;
-    my $managed          = $router->{managed};
+    my $managed          = $router->{managed} || '';
     my $secondary_filter = $managed =~ /secondary$/;
     my $standard_filter  = $managed eq 'standard';
     my $model            = $router->{model};
@@ -18489,7 +18488,7 @@ sub print_acls {
     for my $acl (@$acls) {
         my $no_nat_set = delete $acl->{no_nat_set};
 
-        if ($need_protect) {
+        if ($need_protect and delete $acl->{protect_self}) {
             $acl->{need_protect} = [
 
                 # Remove duplicate addresses from redundancy interfaces.
@@ -18615,6 +18614,10 @@ sub print_acls {
         }
     }
 
+    if ($router->{log_deny}) {
+        $result->{log_deny} = 'log';
+    }
+
     print $fh to_json($result, { pretty => 1, canonical => 1 });
 }
 
@@ -18638,7 +18641,7 @@ sub print_code {
     ($dir) = ($dir =~ /(.*)/);
     check_output_dir($dir);
 
-    progress('Printing code');
+    progress('Printing intermediate code');
     my %seen;
     for my $router (@managed_routers, @routing_only_routers) {
         next if $seen{$router};
@@ -18718,8 +18721,8 @@ sub print_code {
 
         # Print ACLs in machine independent format into separate file.
         # Collect ACLs from VRF parts.
-        my @acls = map { @{ $_->{acl_list} } } @$vrf_members;
-        my $acl_file = "$dir/$file.acls";
+        my @acls = map { @{ $_->{acl_list} || [] } } @$vrf_members;
+        my $acl_file = "$dir/$file.rules";
         open(my $acl_fd, '>', $acl_file)
           or fatal_err("Can't open $acl_file for writing: $!");
         print_acls($router, \@acls, $acl_fd);
@@ -19072,6 +19075,10 @@ sub compile {
     &set_abort_immediately();
     &rules_distribution();
     if ($out_dir) {
+
+        # Signal value to calling program.
+        print $out_dir;
+
         &print_code($out_dir);
         copy_raw($in_path, $out_dir);
     }

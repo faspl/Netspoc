@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/local/bin/perl
 
 =head1 NAME
 
@@ -53,6 +53,11 @@ sub fatal_err {
     die "Aborted\n";
 }
 
+sub debug {
+    print STDERR @_, "\n";
+    return;
+}
+
 sub numerically { return $a <=> $b }
 
 sub read_file {
@@ -89,6 +94,13 @@ sub int2ip {
 sub complement_32bit {
     my ($ip) = @_;
     return ~$ip & 0xffffffff;
+}
+
+sub ip_net2pair {
+    my ($ip_net) = @_;
+    my ($ip, $len) = split '/', $ip_net;
+    $ip = ip2int($ip);
+    return ($ip, $len);    
 }
 
 # Conversion from netmask to prefix and vice versa.
@@ -133,7 +145,7 @@ sub create_prt_obj {
     }
     elsif ($proto eq 'icmp') {
         if (defined($i1)) {
-            $prt->{type} = $i2;
+            $prt->{type} = $i1;
         }
         if (defined($i2)) {
             $prt->{code} = $i2
@@ -174,25 +186,20 @@ sub setup_ip_net_relation {
                 my $i = $ip & $m;
                 my $bignet = $mask_ip_hash{$m}->{$i} or next;
                 $subnet->{up} = $bignet;
+
+#                debug "$subnet->{name} < $bignet->{name}";
+                last;
             }
         }
     }
 
-    # Mark all subnets of supernets marked with {opt_secondary_supernet}.
-    for my $obj (values %$ip_net2obj) {
-        my $up = $obj->{up};
-        while(1) {
-            if (not $up) {
-                $obj->{opt_secondary} = 0;
-                last;
-            }
-            my $opt_secondary = $up->{opt_secondary};
-            if (defined $opt_secondary) {
-                $obj->{opt_secondary} = $opt_secondary;
-                last;
-            }
-            $up = $up->{up};
-        }
+    # Propagate content of attribute {opt_secondary} to all subnets.
+    # Go from large to smaller networks.
+    for my $obj (sort { $a->{mask} <=> $b->{mask} } values %$ip_net2obj) {
+        my $up = $obj->{up} or next;
+        my $opt_secondary = $up->{opt_secondary} or next;
+        $obj->{opt_secondary} = $opt_secondary;
+#        debug "secondary: $obj->{name} $opt_secondary->{name}";
     }
 }
 
@@ -313,10 +320,18 @@ sub order_ranges {
 sub setup_prt_relation {
     my ($prt2obj) = @_;
     my $prt_ip = $prt2obj->{ip} ||= create_prt_obj('ip');
+    my $tcp_establ;
     my %prt_hash;
     for my $prt (values %$prt2obj) {
         my $proto = $prt->{proto};
         if ($proto eq 'tcp' or $proto eq 'udp') {
+
+            # Handle separately.
+            if ($prt->{established}) {
+                $tcp_establ = $prt;
+                next;
+            }
+
             my $range = $prt->{range};
             my $key = join ':', @$range;
             $prt_hash{$proto}->{$key} = $prt;
@@ -343,6 +358,11 @@ sub setup_prt_relation {
     order_ranges($prt_hash{udp}, $up);
     order_icmp($prt_hash{icmp}, $up);
     order_proto($prt_hash{proto}, $up);
+
+    if ($tcp_establ) {
+        $tcp_establ->{up} = $prt_hash{tcp}->{'0:65535'} || $up;
+    }
+
     return \%prt_hash;
 }
 
@@ -427,7 +447,7 @@ sub local_optimization {
             $src = $rule->{src} = $supernet;
         }
         if (my $supernet = $dst->{opt_secondary} and not $dst->{need_protect}) {
-            $dst = $rule->{$dst} = $supernet;
+            $dst = $rule->{dst} = $supernet;
         }
 
         # Change protocol to IP.
@@ -567,11 +587,10 @@ sub join_ranges {
                 my $key   = join(':', @$range);
 
                 # Try to find existing prt with matching range.
-                # This is needed for find_object_groups to work.
+                # This is needed for find_objectgroups to work.
                 my $new_prt = $prt_hash->{$proto}->{$key};
-                unless ($new_prt) {
+                if (not $new_prt) {
                     $new_prt = {
-                        name  => "joined:$prt->{name}",
                         proto => $proto,
                         range => $range
                     };
@@ -592,15 +611,15 @@ sub join_ranges {
 # Add deny and permit rules at device which filters only locally.
 sub add_local_deny_rules {
     my ($acl_info, $router_data) = @_;
-    my ($filter_only, $do_object_group) = 
-        @{$router_data}{qw(filter_only do_object_group)};
+    my ($filter_only, $do_objectgroup) = 
+        @{$router_data}{qw(filter_only do_objectgroup)};
     my ($network_00, $prt_ip) = @{$acl_info}{qw(network_00 prt_ip)};
     my $rules = $acl_info->{rules};
     
     my $src_networks = 
         $acl_info->{filter_any_src} ? [$network_00] : $filter_only;
 
-    if ($do_object_group) {
+    if ($do_objectgroup) {
 
         my $group_or_single = sub {
             my ($obj_list) = @_;
@@ -613,9 +632,9 @@ sub add_local_deny_rules {
                 return $group;
             }
             else {
-                $router_data->{obj_group_counter}++;
                 $group = { name => "g$router_data->{obj_group_counter}",
-                              elements => map { $_->{name} } @$obj_list };
+                           elements => [ map { $_->{name} } @$obj_list ] };
+                $router_data->{obj_group_counter}++;
                 push @{ $acl_info->{object_groups} }, $group;
                 $router_data->{filter_only_group} = $group;
                 return $group;
@@ -641,8 +660,9 @@ sub add_local_deny_rules {
 
 my $min_object_group_size = 2;
 
-sub find_object_groups {
-    my ($acl_info, $router_data, $size2first2group) = @_;
+sub find_objectgroups {
+    my ($acl_info, $router_data) = @_;
+    my $size2first2group = $router_data->{obj_groups_hash};
 
     # Leave 'intf_rules' untouched, because
     # - these rules are ignored at ASA, PIX,
@@ -696,9 +716,9 @@ sub find_object_groups {
 
         my $build_group = sub {
             my ($obj_key_list) = @_;
-            $router_data->{obj_group_counter}++;
             my $group = { name => "g$router_data->{obj_group_counter}", 
                           elements => $obj_key_list };
+            $router_data->{obj_group_counter}++;
 
             # Store group for later printing of its definition.
             push @{ $acl_info->{object_groups} }, $group;
@@ -710,8 +730,15 @@ sub find_object_groups {
             my ($glue) = @_;
             my $hash   = $glue->{hash};
 
-            # Keys are sorted to get some "first" element.
-            my @obj_key_list  = sort keys %$hash;
+            # Keys are "i.i.i.i/len".
+            # Sort keys by IP and prefixlen for normalized output and
+            # to get some "first" element.
+            my @obj_key_list  =
+                map { $_->[0] }
+                sort { $a->[1] <=> $b->[1] || $a->[2] <=> $b->[2] }
+                map { [ $_, ip_net2pair($_) ] }
+                keys %$hash;
+
             my $first = $obj_key_list[0];
             my $size  = @obj_key_list;
 
@@ -742,25 +769,18 @@ sub find_object_groups {
         my @new_rules;
         for my $rule (@$rules) {
             if (my $glue = delete $rule->{group_glue}) {
-
-#               debug(print_rule $rule);
                 if ($glue->{active}) {
-
-#                   debug(" deleted: $glue->{group}->{name}");
                     next;
                 }
                 my $group = $get_group->($glue);
                 $glue->{active} = 1;
-                $rule->{$this} = $group->{name};
-                
-#               debug(" generated: $group->{name}");
-#               # Only needed when debugging.
-#               $glue->{group} = $group;
+                $rule->{$this} = $group;
             }
             push @new_rules, $rule;
         }
-        $acl_info->{rules} = \@new_rules;
+        $rules = \@new_rules;
     }
+    $acl_info->{rules} = $rules;
     return;
 }
 
@@ -814,7 +834,7 @@ sub add_protect_rules {
     # Protect own interfaces.
     for my $interface (@$need_protect) {
         if (    $no_protect{$interface}
-            and not $need_protect{$interface}
+            or  not $need_protect{$interface}
             and not $has_final_permit)
         {
             next;
@@ -847,7 +867,12 @@ sub add_final_permit_deny_rule {
 
     my ($net_00, $prt_ip) = @{$acl_info}{qw(network_00 prt_ip)};
     my $rule = { src => $net_00, dst => $net_00, prt => $prt_ip };
-    $rule->{deny} = 1 if $acl_info->{add_deny};
+    if ($acl_info->{add_deny}) {
+        $rule->{deny} = 1;
+        if (my $log_deny = $router_data->{log_deny}) {
+            $rule->{log} = $log_deny;
+        }
+    }
     push @{ $acl_info->{rules} }, $rule;
 
     return;
@@ -856,11 +881,12 @@ sub add_final_permit_deny_rule {
 sub prepare_acls {
     my ($path) = @_;
     my $router_data = from_json(read_file($path));
-    my ($model, $acls, $filter_only, $do_object_group) =
-        @{$router_data}{qw(model acls filter_only do_object_group)};
+    my ($model, $acls, $filter_only, $do_objectgroup) =
+        @{$router_data}{qw(model acls filter_only do_objectgroup)};
     
     # Reuse identical groups from different ACLs.
-    my $obj_groups_hash = {};
+    $router_data->{obj_groups_hash} = {};
+    $router_data->{obj_group_counter} = 0;
 
     my $ip_net2obj = {};
     my $prt2obj    = {};
@@ -931,8 +957,8 @@ sub prepare_acls {
         my $has_final_permit = check_final_permit($acl_info, $router_data);
         add_protect_rules($acl_info, $router_data, 
                           $has_final_permit || $acl_info->{add_permit});
-        if ($do_object_group) {
-            find_object_groups($acl_info, $obj_groups_hash);
+        if ($do_objectgroup) {
+            find_objectgroups($acl_info, $router_data);
         }
         if ($filter_only) {
             add_local_deny_rules($acl_info, $router_data);
@@ -951,14 +977,13 @@ sub cisco_acl_addr {
 
     # Reference object group.
     if ($ip =~ /^[^0-9]/) {
-        my $keyword =
-          $model->{filter} eq 'NX-OS' ? 'addrgroup' : 'object-group';
+        my $keyword = $model eq 'NX-OS' ? 'addrgroup' : 'object-group';
         return "$keyword $key";
     }
     elsif ($prefix == 0) {
         return "any";
     }
-    elsif ($model =~ /^(:?NX-OS|ACE)/) {
+    elsif ($model eq 'NX-OS') {
         return $key;
     }
     else {
@@ -1052,7 +1077,7 @@ sub cisco_prt_code {
     elsif ($proto eq 'icmp') {
         if (defined(my $type = $prt->{type})) {
             if (defined(my $code = $prt->{code})) {
-                if ($model->{no_filter_icmp_code}) {
+                if ($model =~ /^(:?ASA|PIX)$/) {
 
                     # PIX can't handle the ICMP code field.
                     # If we try to permit e.g. "port unreachable",

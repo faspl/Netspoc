@@ -17467,13 +17467,19 @@ sub print_interface {
     return;
 }
 
+my %obj2nat2address;
 sub print_address {
     my ($obj, $no_nat_set) = @_;
-    return full_prefix_code(address($obj, $no_nat_set));
+    return($obj2nat2address{$obj}->{$no_nat_set} ||= 
+           full_prefix_code(address($obj, $no_nat_set)));
 }
 
+my %prt2code;
 sub print_prt {
     my ($prt) = @_;
+    if (my $result = $prt2code{$prt}) {
+        return $result;
+    }
     my $proto = $prt->{proto};
     my @result = ($proto);
 
@@ -17490,7 +17496,7 @@ sub print_prt {
             push @result, $code;
         }
     }
-    return join(' ', @result);
+    return($prt2code{$prt} = join(' ', @result));
 }
 
 sub print_acls {
@@ -17628,14 +17634,11 @@ sub print_acls {
                     }
                     $new_rule->{opt_secondary} = 1 if $opt_secondary;
                 }
-
-                for my $where (qw(src dst)) {
-                    my $obj = $rule->{$where};
-                    $new_rule->{$where} = print_address($obj, $no_nat_set);
-                }
-                for my $where (qw(src_range prt)) {
-                    my $prt = $rule->{$where} or next;
-                    $new_rule->{$where} = print_prt($prt);
+                $new_rule->{src} = print_address($rule->{src}, $no_nat_set);
+                $new_rule->{dst} = print_address($rule->{dst}, $no_nat_set);
+                $new_rule->{prt} = print_prt($rule->{prt});
+                if (my $src_range = $rule->{src_range}) {
+                    $new_rule->{src_range} = print_prt($src_range);
                 }
                 push @new_rules, $new_rule;
             }
@@ -17663,8 +17666,7 @@ sub print_acls {
         $result->{log_deny} = 'log';
     }
 
-#    print $fh to_json($result, { pretty => 1, canonical => 1 });
-    print $fh to_json($result, { pretty => 0, canonical => 1 });
+    print $fh to_json($result, { pretty => 1, canonical => 1 });
 }
 
 # Make output directory available.
@@ -17987,6 +17989,7 @@ sub init_global_vars {
     %supernet_rule_tree = %missing_supernet = ();
     %smaller_prt        = ();
     %known_log          = %key2log = ();
+    %obj2nat2address    = %prt2code = ();
     init_protocols();
     return;
 }

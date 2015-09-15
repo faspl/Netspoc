@@ -127,6 +127,12 @@ sub ip_net2pair {
     }
 }
 
+# Check if $ip1 is located inside network $ip/$mask.
+sub match_ip {
+    my ($ip1, $ip, $mask) = @_;
+    return ($ip == ($ip1 & $mask));
+}
+
 sub create_ip_obj {
     my ($ip_net) = @_;
     my ($ip, $prefix) = split '/', $ip_net;
@@ -204,8 +210,7 @@ sub setup_ip_net_relation {
 }
 
 sub mark_supernets_of_need_protect {
-    my ($acl_info) = @_;
-    my $need_protect = $acl_info->{need_protect} or return;
+    my ($need_protect) = @_;
     for my $interface (@$need_protect) {
         my $up = $interface->{up};
         while ($up) {
@@ -213,6 +218,13 @@ sub mark_supernets_of_need_protect {
             $up = $up->{up};
         }
     }
+}
+
+sub add_tcp_udp_icmp {
+    my ($prt2obj) = @_;
+    $prt2obj->{'tcp 1-65535'} ||= create_prt_obj('tcp 1-65535');
+    $prt2obj->{'udp 1-65535'} ||= create_prt_obj('udp 1-65535');
+    $prt2obj->{icmp} ||= create_prt_obj('icmp');
 }
 
 sub order_icmp {
@@ -360,7 +372,7 @@ sub setup_prt_relation {
     order_proto($prt_hash{proto}, $up);
 
     if ($tcp_establ) {
-        $tcp_establ->{up} = $prt_hash{tcp}->{'0:65535'} || $up;
+        $tcp_establ->{up} = $prt_hash{tcp}->{'1:65535'} || $up;
     }
 
     return \%prt_hash;
@@ -611,10 +623,10 @@ sub join_ranges {
 # Add deny and permit rules at device which filters only locally.
 sub add_local_deny_rules {
     my ($acl_info, $router_data) = @_;
-    my ($filter_only, $do_objectgroup) = 
-        @{$router_data}{qw(filter_only do_objectgroup)};
+    my $do_objectgroup = $router_data->{do_objectgroup};
     my ($network_00, $prt_ip) = @{$acl_info}{qw(network_00 prt_ip)};
-    my $rules = $acl_info->{rules};
+    my $filter_only = $acl_info->{filter_only};
+    my $rules       = $acl_info->{rules};
     
     my $src_networks = 
         $acl_info->{filter_any_src} ? [$network_00] : $filter_only;
@@ -662,7 +674,10 @@ my $min_object_group_size = 2;
 
 sub find_objectgroups {
     my ($acl_info, $router_data) = @_;
-    my $size2first2group = $router_data->{obj_groups_hash};
+
+    # Reuse identical groups from different ACLs.
+    my $size2first2group = $router_data->{obj_groups_hash} ||= {};
+    $router_data->{obj_group_counter} ||= 0;
 
     # Leave 'intf_rules' untouched, because
     # - these rules are ignored at ASA, PIX,
@@ -853,7 +868,7 @@ sub add_protect_rules {
 sub check_final_permit {
     my ($acl_info, $router_data) = @_;
     my $rules = $acl_info->{rules};
-    @$rules or return;
+    $rules and @$rules or return;
     my ($net_00, $prt_ip) = @{$acl_info}{qw(network_00 prt_ip)};
     my ($deny, $src, $dst, $prt) = @{ $rules->[-1] }{qw(deny src dst prt)};
     return !$deny && $src eq $net_00 && $dst eq $net_00 && $prt eq $prt_ip;
@@ -937,8 +952,8 @@ sub iptables_prt_code {
 sub debug_bintree {
     my ($tree, $depth) = @_;
     $depth ||= '';
-    my $ip      = print_ip $tree->{ip};
-    my $mask    = print_ip $tree->{mask};
+    my $ip      = int2ip($tree->{ip});
+    my $mask    = mask2prefix($tree->{mask});
     my $subtree = $tree->{subtree} ? 'subtree' : '';
 
 #    debug($depth, " $ip/$mask $subtree");
@@ -990,11 +1005,7 @@ sub add_bintree {
     }
 
     # Different nodes with identical IP address.
-    # This shouldn't occur, because different nodes have already
-    # been converted to an unique object:
-    # 1. Different interfaces of redundancy protocols like VRRP or HSRP.
-    # 2. Dynamic NAT of different networks or hosts to a single address
-    #    or range.
+    # This shouldn't occur.
     elsif ($tree_mask == $node_mask && $tree_ip == $node_ip) {
         my $sub1 = $tree->{subtree} || '';
         my $sub2 = $node->{subtree} || '';
@@ -1012,11 +1023,10 @@ sub add_bintree {
             $tree_mask = ($tree_mask & 0x7fffffff) << 1;
             last if ($node_ip & $tree_mask) == ($tree_ip & $tree_mask);
         }
-        $result = new(
-            'Network',
+        $result = {
             ip   => ($node_ip & $tree_mask),
             mask => $tree_mask
-        );
+        };
         @{$result}{qw(lo hi)} =
           $node_ip < $tree_ip ? ($node, $tree) : ($tree, $node);
     }
@@ -1049,22 +1059,20 @@ sub add_bintree {
 
 # Build a binary tree for src/dst objects.
 sub gen_addr_bintree {
-    my ($elements, $tree, $no_nat_set) = @_;
+    my ($elements, $tree) = @_;
 
     # Sort in reverse order by mask and then by IP.
     my @nodes =
       sort { $b->{mask} <=> $a->{mask} || $b->{ip} <=> $a->{ip} }
       map {
-        my ($ip, $mask) = @{ address($_, $no_nat_set) };
+        my ($ip, $mask) = @{$_}{qw(ip mask)};
 
         # The tree's node is a simplified network object with
         # missing attribute 'name' and extra 'subtree'.
-        new(
-            'Network',
-            ip      => $ip,
-            mask    => $mask,
-            subtree => $tree->{$_}
-          )
+        { ip      => $ip,
+          mask    => $mask,
+          subtree => $tree->{$_->{name}}
+        }
       } @$elements;
     my $bintree = pop @nodes;
     while (my $next = pop @nodes) {
@@ -1115,7 +1123,7 @@ sub gen_prt_bintree {
             # current set. But handle direct sub protocols of 'ip' as
             # top protocols.
             while ($up->{up}) {
-                if (my $subtree = $tree->{$up}) {
+                if (my $subtree = $tree->{$up->{name}}) {
 
                     # Found sub protocol of current set.
                     # Optimization:
@@ -1123,7 +1131,7 @@ sub gen_prt_bintree {
                     # have identical subtrees.
                     # This happens for different objects having identical IP
                     # from NAT or from redundant interfaces.
-                    if ($tree->{$prt} ne $subtree) {
+                    if ($tree->{$prt->{name}} ne $subtree) {
                         push @{ $sub_prt{$up} }, $prt;
                     }
                     next PRT;
@@ -1157,7 +1165,7 @@ sub gen_prt_bintree {
             my $node = {
                 proto   => $prt->{proto},
                 range   => $prt->{range},
-                subtree => $tree->{$prt},
+                subtree => $tree->{$prt->{name}},
                 lo      => $lo,
                 hi      => $hi
             };
@@ -1222,7 +1230,7 @@ sub gen_prt_bintree {
 # Add single nodes for numeric protocols.
     if (my $aref = $top_prt{proto}) {
         for my $prt (sort { $a->{proto} <=> $b->{proto} } @$aref) {
-            my $node = { proto => $prt->{proto}, subtree => $tree->{$prt} };
+            my $node = { proto => $prt->{proto}, subtree => $tree->{$prt->{name}} };
             push @seq, $node;
         }
     }
@@ -1257,7 +1265,7 @@ sub gen_prt_bintree {
                         proto   => 'icmp',
                         type    => $_->{proto},
                         code    => $_->{code},
-                        subtree => $tree->{$_}
+                        subtree => $tree->{$_->{name}}
                     }
                   }
                   sort { $a->{code} <=> $b->{code} } @$aref
@@ -1291,7 +1299,7 @@ sub gen_prt_bintree {
                 $node2 = {
                     proto   => 'icmp',
                     type    => $type,
-                    subtree => $tree->{$prt}
+                    subtree => $tree->{$prt->{name}}
                 };
                 if (my $aref3 = $sub_prt{$prt}) {
                     $node2->{seq} = $gen_icmp_type_code_sorted->($aref3);
@@ -1306,7 +1314,7 @@ sub gen_prt_bintree {
             $node = {
                 proto   => 'icmp',
                 seq     => \@seq2,
-                subtree => $tree->{$icmp_any}
+                subtree => $tree->{$icmp_any->{name}}
             };
         }
         elsif (@seq2 > 1) {
@@ -1324,7 +1332,7 @@ sub gen_prt_bintree {
         $bintree = {
             proto   => 'ip',
             seq     => \@seq,
-            subtree => $tree->{$ip_prt}
+            subtree => $tree->{$ip_prt->{name}}
         };
     }
     elsif (@seq > 1) {
@@ -1340,15 +1348,23 @@ sub gen_prt_bintree {
     return $bintree;
 }
 
-my %ref_type = (
-    src     => \%ref2obj,
-    dst     => \%ref2obj,
-    src_prt => \%ref2prt,
-    prt     => \%ref2prt,
-);
-
 sub find_chains {
-    my ($rules, $router_data) = @_;
+    my ($acl_info, $router_data) = @_;
+    my $rules      = $acl_info->{rules};
+    my $ip_net2obj = $acl_info->{ip_net2obj};
+    my $prt2obj    = $acl_info->{prt2obj};
+    my %ref_type = (
+        src       => $ip_net2obj,
+        dst       => $ip_net2obj,
+        src_range => $prt2obj,
+        prt       => $prt2obj,
+    );
+
+    my $prt_ip     = $prt2obj->{ip};
+    my $prt_icmp   = $prt2obj->{icmp};
+    my $prt_tcp    = $prt2obj->{'tcp 1-65535'};
+    my $prt_udp    = $prt2obj->{'udp 1-65535'};
+    my $network_00 = $ip_net2obj->{'0.0.0.0/0'};
 
     # For generating names of chains.
     # Initialize if called first time.
@@ -1356,24 +1372,24 @@ sub find_chains {
 
     # Set {action} attribute in $rule, so we can handle all properties
     # of a rule in unified manner.
-    # Set {src_range} attribute.
+    # Change {src_range} attribute.
     for my $rule (@$rules) {
         if (!$rule->{action}) {
             $rule->{action} = $rule->{deny} ? 'deny' : 'permit';
         }
-        my $src_prt = $rule->{src_range};
-        if (not $src_prt) {
+        my $src_range = $rule->{src_range};
+        if (not $src_range) {
             my $proto = $rule->{prt}->{proto};
 
             # Specify protocols tcp, udp, icmp in
-            # {src_prt}, to get more efficient chains.
-            $src_prt =
-                $proto eq 'tcp'  ? $prt_tcp->{dst_range}
-              : $proto eq 'udp'  ? $prt_udp->{dst_range}
+            # {src_range}, to get more efficient chains.
+            $src_range =
+                $proto eq 'tcp'  ? $prt_tcp
+              : $proto eq 'udp'  ? $prt_udp
               : $proto eq 'icmp' ? $prt_icmp
               :                    $prt_ip;
+            $rule->{src_range} = $src_range;
         }
-        $rule->{src_prt} = $src_prt;
     }
 
     my %cache;
@@ -1381,14 +1397,11 @@ sub find_chains {
     my $print_tree;
     $print_tree = sub {
         my ($tree, $order, $depth) = @_;
-        my $key      = $order->[$depth];
-        my $ref2x    = $ref_type{$key};
-        my @elements = map { $ref2x->{$_} } keys %$tree;
-        for my $elem (@elements) {
+        for my $name (keys %$tree) {
 
-#            debug(' ' x $depth, "$elem->{name}");
+#            debug(' ' x $depth, $name);
             if ($depth < $#$order) {
-                $print_tree->($tree->{$elem}, $order, $depth + 1);
+                $print_tree->($tree->{$name}, $order, $depth + 1);
             }
         }
     };
@@ -1403,10 +1416,10 @@ sub find_chains {
         # (binary) tree. This is used later to convert subsequent tests
         # for ip/mask or port ranges into more efficient nested chains.
         my $bintree;
-        if ($ref2x eq \%ref2obj) {
-            $bintree = gen_addr_bintree(\@elements, $tree, $no_nat_set);
+        if ($ref2x eq $ip_net2obj) {
+            $bintree = gen_addr_bintree(\@elements, $tree);
         }
-        else {    # $ref2x eq \%ref2prt
+        else {    # $ref2x eq $prt2obj
             $bintree = gen_prt_bintree(\@elements, $tree);
         }
         return $bintree;
@@ -1473,14 +1486,10 @@ sub find_chains {
     # Add new chain to current router.
     my $new_chain = sub {
         my ($rules) = @_;
-        my $counter = $router->{vrf_shared_data}->{chain_counter}++;
-        my $chain   = new(
-            'Chain',
-            name  => "c$counter",
-            rules => $rules,
-        );
-        push @{ $router->{chains} }, $chain;
-        $chain;
+        my $counter = $router_data->{chain_counter}++;
+        my $chain   = { name  => "c$counter", rules => $rules, };
+        push @{ $router_data->{chains} }, $chain;
+        return $chain;
     };
 
     my $gen_chain;
@@ -1582,7 +1591,7 @@ sub find_chains {
 
                 # Count, which key has the largest number of
                 # different values.
-                for my $what (qw(src dst src_prt prt)) {
+                for my $what (qw(src dst src_range prt)) {
                     $count{$what}{ $rule->{$what} } = 1;
                 }
                 $i++;
@@ -1594,13 +1603,15 @@ sub find_chains {
                 # fewer tests in chains.
                 my @test_order =
                   sort { keys %{ $count{$a} } <=> keys %{ $count{$b} } }
-                  qw(src_prt dst prt src);
+                  qw(src_range dst prt src);
                 my $rule_tree;
                 my $end = $i - 1;
                 for (my $j = $start ; $j <= $end ; $j++) {
                     my $rule = $rules->[$j];
                     my ($action, $t1, $t2, $t3, $t4) =
                       @{$rule}{ 'action', @test_order };
+                    ($t1, $t2, $t3, $t4) = 
+                        map { $_->{name} } ($t1, $t2, $t3, $t4);
                     $rule_tree->{$t1}->{$t2}->{$t3}->{$t4} = $action;
                 }
                 push @rule_trees, $rule_tree;
@@ -1636,41 +1647,57 @@ sub find_chains {
             $rule->{src} ||= $network_00;
             $rule->{dst} ||= $network_00;
             my $prt     = $rule->{prt};
-            my $src_prt = $rule->{src_prt};
-            if (not $prt and not $src_prt) {
+            my $src_range = $rule->{src_range};
+            if (not $prt and not $src_range) {
                 $rule->{prt} = $prt_ip;
             }
             elsif (not $prt) {
                 $rule->{prt} =
-                    $src_prt->{proto} eq 'tcp'  ? $prt_tcp->{dst_range}
-                  : $src_prt->{proto} eq 'udp'  ? $prt_udp->{dst_range}
-                  : $src_prt->{proto} eq 'icmp' ? $prt_icmp
-                  :                               $prt_ip;
-
-                # Restore {src_range} from {src_prt}, because
-                # {src_range} is only used in find_chains.
-                $rule->{src_range} = delete $rule->{src_prt};
+                    $src_range->{proto} eq 'tcp'  ? $prt_tcp
+                  : $src_range->{proto} eq 'udp'  ? $prt_udp
+                  : $src_range->{proto} eq 'icmp' ? $prt_icmp
+                  :                                 $prt_ip;
             }
         }
         push @$rules, @$result;
     }
+    $acl_info->{rules} = $rules;
     return;
+}
+
+# Given an IP and mask, return its address
+# as "x.x.x.x/x" or "x.x.x.x" if prefix == 32.
+sub prefix_code {
+    my ($ip_net) = @_;
+    my ($ip, $mask) = @{$ip_net}{qw(ip mask)};
+    my $ip_code     = int2ip($ip);
+    my $prefix_code = mask2prefix($mask);
+    return $prefix_code == 32 ? $ip_code : "$ip_code/$prefix_code";
 }
 
 # Print chains of iptables.
 # Objects have already been normalized to ip/mask pairs.
 # NAT has already been applied.
 sub print_chains {
-    my ($router) = @_;
+    my ($router_data) = @_;
+    my $chains = $router_data->{chains};
+    @$chains or return;
+
+    my $acl_info   = $router_data->{acls}->[0];
+    my $prt2obj    = $acl_info->{prt2obj};
+    my $prt_ip     = $prt2obj->{ip};
+    my $prt_icmp   = $prt2obj->{icmp};
+    my $prt_tcp    = $prt2obj->{'tcp 1-65535'};
+    my $prt_udp    = $prt2obj->{'udp 1-65535'};
 
     # Declare chain names.
-    for my $chain (@{ $router->{chains} }) {
+    for my $chain (@$chains) {
         my $name = $chain->{name};
         print ":$name -\n";
     }
 
     # Define chains.
-    for my $chain (@{ $router->{chains} }) {
+    for my $chain (@$chains) {
         my $name   = $chain->{name};
         my $prefix = "-A $name";
 
@@ -1678,7 +1705,7 @@ sub print_chains {
         for my $rule (@{ $chain->{rules} }) {
             my $action = $rule->{action};
             my $action_code =
-                is_chain($action)   ? $action->{name}
+                ref($action)        ? $action->{name}
               : $action eq 'permit' ? 'ACCEPT'
               :                       'droplog';
 
@@ -1703,34 +1730,32 @@ sub print_chains {
             my $jump = $rule->{goto} ? '-g' : '-j';
             my $result = "$jump $action_code";
             if (my $src = $rule->{src}) {
-                my $ip_mask = [ @{$src}{qw(ip mask)} ];
-                if ($ip_mask->[1] != 0) {
-                    $result .= ' -s ' . prefix_code($ip_mask);
+                if ($src->{mask}) {
+                    $result .= ' -s ' . prefix_code($src);
                 }
             }
             if (my $dst = $rule->{dst}) {
-                my $ip_mask = [ @{$dst}{qw(ip mask)} ];
-                if ($ip_mask->[1] != 0) {
-                    $result .= ' -d ' . prefix_code($ip_mask);
+                if ($dst->{mask}) {
+                    $result .= ' -d ' . prefix_code($dst);
                 }
             }
           ADD_PROTO:
             {
-                my $src_prt = $rule->{src_prt};
-                my $prt     = $rule->{prt};
-                last ADD_PROTO if not $src_prt and not $prt;
+                my $src_range = $rule->{src_range};
+                my $prt       = $rule->{prt};
+                last ADD_PROTO if not $src_range and not $prt;
                 last ADD_PROTO if $prt and $prt->{proto} eq 'ip';
                 if (not $prt) {
-                    last ADD_PROTO if $src_prt->{proto} eq 'ip';
+                    last ADD_PROTO if $src_range->{proto} eq 'ip';
                     $prt =
-                        $src_prt->{proto} eq 'tcp'  ? $prt_tcp->{dst_range}
-                      : $src_prt->{proto} eq 'udp'  ? $prt_udp->{dst_range}
-                      : $src_prt->{proto} eq 'icmp' ? $prt_icmp
-                      :                               $prt_ip;
+                        $src_range->{proto} eq 'tcp'  ? $prt_tcp
+                      : $src_range->{proto} eq 'udp'  ? $prt_udp
+                      : $src_range->{proto} eq 'icmp' ? $prt_icmp
+                      :                                 $prt_ip;
                 }
 
 #               debug("c ",print_rule $rule) if not $src_range or not $prt;
-                $result .= ' ' . iptables_prt_code($src_prt, $prt);
+                $result .= ' ' . iptables_prt_code($src_range, $prt);
             }
             print "$prefix $result\n";
         }
@@ -1746,29 +1771,59 @@ sub print_chains {
     return;
 }
 
+sub iptables_acl_line {
+    my ($rule, $prefix) = @_;
+    my ($action, $src, $dst, $src_range, $prt) =
+      @{$rule}{qw(action src dst src_range prt)};
+    my $action_code =
+        ref($action)        ? $action->{name}
+      : $action eq 'permit' ? 'ACCEPT'
+      :                       'droplog';
+    my $jump = $rule->{goto} ? '-g' : '-j';
+    my $result = "$prefix $jump $action_code";
+    if ($src->{mask}) {
+        $result .= ' -s ' . prefix_code($src);
+    }
+    if ($dst->{mask}) {
+        $result .= ' -d ' . prefix_code($dst);
+    }
+    if ($prt->{proto} ne 'ip') {
+        $result .= ' ' . iptables_prt_code($src_range, $prt);
+    }
+    print "$result\n";
+    return;
+}
+
+sub print_iptables_acl {
+    my ($acl_info) = @_;
+    my $name = $acl_info->{name};
+    print ":$name -\n";
+    my $rules = $acl_info->{rules};
+    my $intf_prefix = "-A $name";
+    for my $rule (@$rules) {
+        iptables_acl_line($rule, $intf_prefix);
+    }
+}
+
 sub prepare_acls {
     my ($path) = @_;
     my $router_data = from_json(read_file($path));
     my ($model, $acls, $filter_only, $do_objectgroup) =
         @{$router_data}{qw(model acls filter_only do_objectgroup)};
     
-    # Reuse identical groups from different ACLs.
-    $router_data->{obj_groups_hash} = {};
-    $router_data->{obj_group_counter} = 0;
-
-    my $ip_net2obj = $router_data->{ip_net2obj} = {};
-    my $prt2obj    = $router_data->{prt2obj}    = {};
-
-    if ($filter_only) {
-        for my $ip_net (@$filter_only) {
-            my $obj = $ip_net2obj->{$ip_net} ||= create_ip_obj($ip_net);
-
-            # Update original array.
-            $ip_net = $obj;
-        }
-    }
-            
     for my $acl_info (@$acls) {
+
+        # Process networks and protocols of each interface individually,
+        # because relation between networks may be changed by NAT.
+        my $ip_net2obj = $acl_info->{ip_net2obj} = {};
+        my $prt2obj    = $acl_info->{prt2obj}    = {};
+
+        if ($filter_only) {
+            $acl_info->{filter_only} = [
+                map { $ip_net2obj->{$_} ||= create_ip_obj($_); }
+                @$filter_only ]
+        }
+            
         for my $what (qw(intf_rules rules)) {
             my $rules = $acl_info->{$what} or next;
             for my $rule (@$rules) {
@@ -1801,38 +1856,44 @@ sub prepare_acls {
 
         setup_ip_net_relation($ip_net2obj);
         $acl_info->{network_00} = $ip_net2obj->{'0.0.0.0/0'};
-        mark_supernets_of_need_protect($acl_info);
+    
+        if (my $need_protect = $acl_info->{need_protect}) {
+            mark_supernets_of_need_protect($need_protect);
+        }
+        if ($model eq 'Linux') {
+            add_tcp_udp_icmp($prt2obj);
+        }
         
         my $prt_hash = setup_prt_relation($prt2obj);
         my $prt_ip = $acl_info->{prt_ip} = $prt2obj->{ip};
         
-        for my $what (qw(intf_rules rules)) {
-            my $rules = $acl_info->{$what} or next;
-            if ($model eq 'Linux') {
-                $rules = find_chains($rules, $router_data);
-            }
-            else {
+        if ($model eq 'Linux') {
+            find_chains($acl_info, $router_data);
+        }
+        else {
+            for my $what (qw(intf_rules rules)) {
+                my $rules = $acl_info->{$what} or next;
                 $rules = local_optimization($rules, $prt_ip);
     
                 # Join adjacent port ranges. This must be called after
                 # local optimization, because protocols will be
                 # overlapping again after joining.
                 $rules = join_ranges($rules, $prt_hash);
+                $acl_info->{$what} = $rules;
             }
-            $acl_info->{$what} = $rules;
-        }
 
-        my $has_final_permit = check_final_permit($acl_info, $router_data);
-        add_protect_rules($acl_info, $router_data, 
-                          $has_final_permit || $acl_info->{add_permit});
-        if ($do_objectgroup) {
-            find_objectgroups($acl_info, $router_data);
-        }
-        if ($filter_only) {
-            add_local_deny_rules($acl_info, $router_data);
-        }
-        elsif (not $has_final_permit) {
-            add_final_permit_deny_rule($acl_info, $router_data);
+            my $has_final_permit = check_final_permit($acl_info, $router_data);
+            add_protect_rules($acl_info, $router_data, 
+                              $has_final_permit || $acl_info->{add_permit});
+            if ($do_objectgroup and not $acl_info->{is_crypto_acl}) {
+                find_objectgroups($acl_info, $router_data);
+            }
+            if ($filter_only) {
+                add_local_deny_rules($acl_info, $router_data);
+            }
+            elsif (not $has_final_permit) {
+                add_final_permit_deny_rule($acl_info, $router_data);
+            }
         }
     }
     return $router_data;
@@ -2024,9 +2085,16 @@ sub print_cisco_acl {
 }
 
 sub print_acl {
-    my ($acl_info, $model) = @_;
+    my ($acl_info, $router_data) = @_;
+    my $model = $router_data->{model};
 
     if ($model eq 'Linux') {
+
+        # Print all sub-chains at once before first toplevel chain is printed.
+        if ($router_data->{chains}) {
+            print_chains($router_data);
+            delete $router_data->{chains};
+        }
         print_iptables_acl($acl_info);
     }
     else {
@@ -2046,7 +2114,7 @@ sub print_combined {
         or fatal_err("Can't open $out_path for writing: $!");
     select $out_fd;
 
-    my ($acls, $model) = @{$router_data}{qw(acls model)};
+    my $acls = $router_data->{acls};
     my %acl_hash = map { $_->{name} => $_ } @$acls;
 
     # Print config and insert printed ACLs at "#insert <name>" markers.
@@ -2056,7 +2124,7 @@ sub print_combined {
         if (my ($acl_name) = ($line =~ /^#insert (.*)\n$/)) {
             my $acl_info = $acl_hash{$acl_name} or 
                 fatal_err("Unexpected ACL $acl_name");
-            print_acl($acl_info, $model);
+            print_acl($acl_info, $router_data);
         }
 
         # Print unchanged config line.

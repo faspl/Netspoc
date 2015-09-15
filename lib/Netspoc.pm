@@ -16600,31 +16600,6 @@ EOF
     return;
 }
 
-sub iptables_acl_line {
-    my ($rule, $no_nat_set, $prefix) = @_;
-    my ($action, $src, $dst, $src_range, $prt) =
-      @{$rule}{qw(action src dst src_range prt)};
-    my $spair = address($src, $no_nat_set);
-    my $dpair = address($dst, $no_nat_set);
-    my $action_code =
-        is_chain($action)   ? $action->{name}
-      : $action eq 'permit' ? 'ACCEPT'
-      :                       'droplog';
-    my $jump = $rule->{goto} ? '-g' : '-j';
-    my $result = "$prefix $jump $action_code";
-    if ($spair->[1] != 0) {
-        $result .= ' -s ' . prefix_code($spair);
-    }
-    if ($dpair->[1] != 0) {
-        $result .= ' -d ' . prefix_code($dpair);
-    }
-    if ($prt ne $prt_ip) {
-        $result .= ' ' . iptables_prt_code($src_range, $prt);
-    }
-    print "$result\n";
-    return;
-}
-
 # Pre-processing for all interfaces.
 sub print_acl_prefix {
     my ($router) = @_;
@@ -16685,13 +16660,12 @@ sub print_iptables_acls {
         # Collect interface rules.
         # Add call to chain in INPUT chain.
         my $intf_acl_name = "${in_hw}_self";
-        my $acl_info = {
+        my $intf_acl_info = {
             name => $intf_acl_name,
             rules => $hardware->{intf_rules} || [],
             add_deny => 1,
             no_nat_set => $no_nat_set,
         };
-        push @{ $router->{acl_list} }, $acl_info;
         print_acl_placeholder($intf_acl_name);
         print "-A INPUT -j $intf_acl_name -i $in_hw\n";
 
@@ -16711,6 +16685,12 @@ sub print_iptables_acls {
             print_acl_placeholder($acl_name);
             print "-A FORWARD -j $acl_name -i $in_hw -o $out_hw\n";
         }
+
+        # Add late for compatibility of output.
+        push @{ $router->{acl_list} }, $intf_acl_info;
+
+        # Empty line after each chain.
+        print "\n";
     }
     return;
 }
@@ -16763,9 +16743,12 @@ sub print_cisco_acls {
             # - set {filter_any_src}.
             if ($suffix eq 'in') {
                 $acl_info->{rules} = $hardware->{rules};
+
+                # Marker: Generate protect_self rules, if available.
+                $acl_info->{protect_self} = 1;
+
                 if ($router->{need_protect}) {
                     $acl_info->{intf_rules} = $hardware->{intf_rules};
-                    $acl_info->{protect_self} = 1;
                 }
                 if ($hardware->{no_in_acl}) {
                     $acl_info->{add_permit} = 1;
@@ -16979,6 +16962,7 @@ sub print_crypto_acl {
         name => $crypto_acl_name,
         rules => $crypto_rules,
         no_nat_set => $no_nat_set,
+        is_crypto_acl => 1,
     };
     push @{ $router->{acl_list} }, $acl_info;
     print_acl_placeholder($crypto_acl_name);
@@ -17560,6 +17544,7 @@ sub print_acls {
 
         for my $what (qw(intf_rules rules)) {
             my $rules = $acl->{$what} or next;
+            my @new_rules;
             for my $rule (@$rules) {
                 my $new_rule = {};
 
@@ -17652,16 +17637,15 @@ sub print_acls {
                     my $prt = $rule->{$where} or next;
                     $new_rule->{$where} = print_prt($prt);
                 }
-                $rule = $new_rule;
+                push @new_rules, $new_rule;
             }
+            $acl->{$what} = \@new_rules;
         }
 
         if (keys %opt_addr) {
             $acl->{opt_secondary} = [ sort keys %opt_addr ];
-        }        
-
+        }
     }
-
     my $result = { model => $model->{class}, acls  => $acls, };
 
     if (my $filter_only = $router->{filter_only}) {
@@ -17679,7 +17663,8 @@ sub print_acls {
         $result->{log_deny} = 'log';
     }
 
-    print $fh to_json($result, { pretty => 1, canonical => 1 });
+#    print $fh to_json($result, { pretty => 1, canonical => 1 });
+    print $fh to_json($result, { pretty => 0, canonical => 1 });
 }
 
 # Make output directory available.
@@ -17782,11 +17767,11 @@ sub print_code {
 
         # Print ACLs in machine independent format into separate file.
         # Collect ACLs from VRF parts.
-        my @acls = map { @{ $_->{acl_list} || [] } } @$vrf_members;
+        my @acl_list = map { @{ delete $_->{acl_list} || [] } } @$vrf_members;
         my $acl_file = "$dir/$file.rules";
         open(my $acl_fd, '>', $acl_file)
           or fatal_err("Can't open $acl_file for writing: $!");
-        print_acls($router, \@acls, $acl_fd);
+        print_acls($router, \@acl_list, $acl_fd);
         close $acl_fd or fatal_err("Can't close $acl_file: $!");
 
     }

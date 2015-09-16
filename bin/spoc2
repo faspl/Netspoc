@@ -480,9 +480,12 @@ sub local_optimization {
 
         # Add new rule to rule_tree. If multiple rules are converted to the
         # same secondary rule, only the first one will be generated.
-        if ($rule_tree{''}->{$prt_ip}->{$src}->{$dst}->{$prt_ip}) {
+        if (my $other = $rule_tree{''}->{$prt_ip}->{$src}->{$dst}->{$prt_ip}) {
 
-#            debug("sec delete: ", print_rule $rule);
+            # Don't remove if rule already was in optimized form.
+            next if $rule eq $other;
+
+#           debug("sec delete: ", print_rule $rule);
             $rule    = undef;
             $changed = 1;
         }

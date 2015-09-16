@@ -17506,7 +17506,6 @@ sub print_acls {
     my $standard_filter  = $managed eq 'standard';
     my $model            = $router->{model};
     my $do_auth          = $model->{do_auth};
-    my %opt_addr;
     my $active_log       = $router->{log};
     my $need_protect;
 
@@ -17537,6 +17536,10 @@ sub print_acls {
     }
 
     for my $acl (@$acls) {
+
+        # Collect networks used in secondary optimization.
+        my %opt_addr;
+
         my $no_nat_set = delete $acl->{no_nat_set};
 
         if ($need_protect and delete $acl->{protect_self}) {

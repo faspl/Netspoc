@@ -17641,6 +17641,9 @@ sub print_acls {
                             if (my $max = $obj->{max_secondary_net}) {
                                 $obj = $max;
                             }
+
+                            # Ignore loopback network.
+                            next if $obj->{mask} == 0xffffffff;
                         }
                         
                         # Network or aggregate.

@@ -10,9 +10,5 @@ out_dir=$(spoc1 "$@")
 
 #count=$(ls *.config|wc -l)
 #status "Processing code for $count devices"
-for config in $out_dir/*.config; do
-    base=$(basename $config .config)
-    rules="$out_dir/$base.rules"
-    spoc2 $rules $config $out_dir/$base
-done
+spoc2 $out_dir
 #status Finished

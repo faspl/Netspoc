@@ -6,11 +6,12 @@ spoc2 - Optimizing second pass of Netspoc
 
 =head1 SYNOPSIS
 
-spoc2 in-rules in-config out-config
+spoc2 CODE-DIR
 
 =head1 DESCRIPTION
 
-Generate device configuration from two input files.
+Generate code files from intermediate files in CODE-DIR.
+Reads files X.rules and X.config and writes file X.
 
 First input file contains rules in device independent format.
 Second input file is incomplete device configuration.
@@ -45,6 +46,7 @@ use strict;
 use warnings;
 use JSON;
 use Pod::Usage;
+use File::Basename;
 use open qw(:std :utf8);
 
 sub fatal_err {
@@ -2190,11 +2192,15 @@ sub print_combined {
 
 sub pass2 {
     my ($args) = @_;
-    my ($rules_path, $config_path, $out_path, @extra) = @$args;
-    ($rules_path && $config_path && $out_path || @extra) or pod2usage(2);
-    my $router_data = prepare_acls($rules_path);
-    my $config = read_file_lines($config_path);
-    print_combined($config, $router_data, $out_path);
+    my ($dir, @extra) = @$args;
+    ($dir || @extra) or pod2usage(2);
+    for my $config_path (glob("$dir/*.config")) {
+        my $base_path = "$dir/" . basename($config_path, '.config');
+        my $rules_path = "$base_path.rules";
+        my $router_data = prepare_acls($rules_path);
+        my $config = read_file_lines($config_path);
+        print_combined($config, $router_data, $base_path);
+    }
 }
 
 pass2(\@ARGV);

@@ -64,6 +64,11 @@ sub debug {
     return;
 }
 
+sub info {
+    print STDERR @_, "\n";
+    return;
+}
+
 sub numerically { return $a <=> $b }
 
 sub read_file {
@@ -2199,13 +2204,53 @@ sub print_combined {
     return;
 }
 
+# Check if identical files with extension .config and .rules
+# exist in directory .prev/ .
+sub check_prev {
+    my ($base_path) = @_;
+    for my $ext (qw(.config .rules)) {
+        my $path = "$base_path$ext";
+        my $prev_path = ".prev/$path";
+        -f $prev_path or return;
+        system("cmp $path $prev_path") == 0 or return;
+    }
+    return 1;        
+}
+
+# Generate code files from *.config and *.rules files.
 sub pass2 {
     my ($args) = @_;
     my ($dir, @extra) = @$args;
     ($dir and not @extra) or pod2usage(2);
-    for my $config_path (glob("$dir/*.config")) {
-        my $base_path = "$dir/" . basename($config_path, '.config');
-        my $rules_path = "$base_path.rules";
+    chdir $dir or fatal_err("Can't chdir to '$dir': $!");
+    my $has_prev = -d '.prev';
+    my @pass1_list = map { basename($_, '.config') } glob('*.config');
+    my @pass2_list;
+
+    my $count = @pass1_list;
+    info("Starting second pass for $count devices");
+    my $reused;
+    for my $base_path (@pass1_list) {
+
+        # Try to reuse prevously generated code file.
+        if ($has_prev and check_prev($base_path) and
+            system("cp -p .prev/$base_path $base_path") == 0)
+        {
+            $reused++;
+            next;
+        }
+        push @pass2_list, $base_path;
+    }
+    if ($reused) {
+        info("Reusing $reused files from previous run");
+    }
+
+    # Generate new code files.
+    $count = @pass2_list;
+    info("Optimizing and printing code for $count devices");
+    for my $base_path (@pass2_list) {
+        my $config_path = "$base_path.config";
+        my $rules_path  = "$base_path.rules";
         my $router_data = prepare_acls($rules_path);
         my $config = read_file_lines($config_path);
         print_combined($config, $router_data, $base_path);

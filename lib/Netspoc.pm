@@ -17510,169 +17510,182 @@ sub print_prt {
 }
 
 sub print_acls {
-    my ($router, $acls, $fh) = @_;
-    my $managed          = $router->{managed} || '';
-    my $secondary_filter = $managed =~ /secondary$/;
-    my $standard_filter  = $managed eq 'standard';
-    my $model            = $router->{model};
-    my $do_auth          = $model->{do_auth};
-    my $active_log       = $router->{log};
-    my $need_protect;
+    my ($vrf_members, $fh) = @_;
+    my @acl_list;
 
-    # Collect interfaces that need protection by additional deny rules.
-    # Add list to each ACL separately, because IP may be changed by NAT.
-    if (
-        $router->{need_protect}
-        ||
+    for my $router (@$vrf_members) {
 
-        # ASA protects IOS router behind crosslink interface.
-        $router->{crosslink_interfaces}
-      )
-    {
+        my $managed          = $router->{managed} || '';
+        my $secondary_filter = $managed =~ /secondary$/;
+        my $standard_filter  = $managed eq 'standard';
+        my $model            = $router->{model};
+        my $do_auth          = $model->{do_auth};
+        my $active_log       = $router->{log};
+        my $need_protect;
 
-        # Routers connected by crosslink networks are handled like one
-        # large router. Protect the collected interfaces of the whole
-        # cluster at each entry.
-        $need_protect = $router->{crosslink_interfaces};
-        if (!$need_protect) {
-            $need_protect = $router->{interfaces};
-            $need_protect = [ 
-                grep({ $_->{ip} !~ /^(?:unnumbered|negotiated|tunnel|bridged)$/ } 
-                     @$need_protect) ];
-            if ($model->{has_vip}) {
-                $need_protect = [ grep { !$_->{vip} } @$need_protect ];
+        # Collect interfaces that need protection by additional deny rules.
+        # Add list to each ACL separately, because IP may be changed by NAT.
+        if (
+            $router->{need_protect}
+            ||
+
+            # ASA protects IOS router behind crosslink interface.
+            $router->{crosslink_interfaces}
+          )
+        {
+
+            # Routers connected by crosslink networks are handled like
+            # one large router. Protect the collected interfaces of
+            # the whole cluster at each entry.
+            $need_protect = $router->{crosslink_interfaces};
+            if (!$need_protect) {
+                $need_protect = $router->{interfaces};
+                $need_protect = [ 
+                    grep({ $_->{ip} !~ /^(?:unnumbered|negotiated|tunnel|bridged)$/ } 
+                         @$need_protect) ];
+                if ($model->{has_vip}) {
+                    $need_protect = [ grep { !$_->{vip} } @$need_protect ];
+                }
             }
         }
-    }
 
-    for my $acl (@$acls) {
+        for my $acl (@{ $router->{acl_list} }) {
 
-        # Collect networks used in secondary optimization.
-        my %opt_addr;
+            # Don't modify loop variable.
+            # Otherwise we get some memory loss.
+            my $acl = { %$acl };
 
-        my $no_nat_set = delete $acl->{no_nat_set};
+            # Collect networks used in secondary optimization.
+            my %opt_addr;
 
-        if ($need_protect and delete $acl->{protect_self}) {
-            $acl->{need_protect} = [
+            my $no_nat_set = delete $acl->{no_nat_set};
 
-                # Remove duplicate addresses from redundancy interfaces.
-                unique
-                map({ full_prefix_code(address($_, $no_nat_set)) }
-                    @$need_protect) ];
-        }
+            if ($need_protect and delete $acl->{protect_self}) {
+                $acl->{need_protect} = [
 
-        for my $what (qw(intf_rules rules)) {
-            my $rules = $acl->{$what} or next;
-            my @new_rules;
-            for my $rule (@$rules) {
-                my $new_rule = {};
+                    # Remove duplicate addresses from redundancy interfaces.
+                    unique
+                    map({ full_prefix_code(address($_, $no_nat_set)) }
+                        @$need_protect) ];
+            }
 
-                my $deny = $rule->{deny};
-                $new_rule->{deny} = 1 if $deny;
+            for my $what (qw(intf_rules rules)) {
+                my $rules = $acl->{$what} or next;
+                my @new_rules;
+                for my $rule (@$rules) {
+                    my $new_rule = {};
 
-                # Add code for logging.
-                # This code is machine specific.
-                my $log_code;
-                if ($active_log && (my $log = $rule->{log})) {
-                    for my $tag (@$log) {
-                        if (exists $active_log->{$tag}) {
-                            if (my $modifier = $active_log->{$tag}) {
-                                my $normalized = 
-                                    $model->{log_modifiers}->{$modifier};
-                                if ($normalized eq ':subst') {
-                                    $log_code = $modifier;
+                    my $deny = $rule->{deny};
+                    $new_rule->{deny} = 1 if $deny;
+
+                    # Add code for logging.
+                    # This code is machine specific.
+                    my $log_code;
+                    if ($active_log && (my $log = $rule->{log})) {
+                        for my $tag (@$log) {
+                            if (exists $active_log->{$tag}) {
+                                if (my $modifier = $active_log->{$tag}) {
+                                    my $normalized = 
+                                        $model->{log_modifiers}->{$modifier};
+                                    if ($normalized eq ':subst') {
+                                        $log_code = $modifier;
+                                    }
+                                    else {
+                                        $log_code = "log $normalized";
+                                    }
                                 }
                                 else {
-                                    $log_code = "log $normalized";
+                                    $log_code = 'log';
                                 }
-                            }
-                            else {
-                                $log_code = 'log';
-                            }
-                            
-                            # Take first of possibly several matching tags.
-                            last;
-                        }
-                    }
-                }
-                if ($log_code) {
-                    $new_rule->{log} = $log_code;
-                }
-                elsif ($router->{log_deny} && $deny) {
-                    $new_rule->{log} = 'log';
-                }
 
-                my $opt_secondary;
-                if (   $secondary_filter && $rule->{some_non_secondary}
-                    || $standard_filter && $rule->{some_primary})
-                {
-                    $opt_secondary = 1;
-
-                    for my $where (qw(src dst)) {
-                        my $obj = $rule->{$where};
-
-                        # Prepare secondary optimization.
-                        my $type = ref($obj);
-
-                        # Restrict secondary optimization at
-                        # authenticating router to prevent
-                        # unauthorized access with spoofed IP
-                        # address.
-                        if ($do_auth) {
-
-                            # Single ID-hosts must not be converted to
-                            # network.
-                            if ($type eq 'Subnet') {
-                                next if $obj->{id};
-                            }
-
-                            # Network with ID-hosts must not be
-                            # optimized at all.
-                            if ($obj->{has_id_hosts}) {
-                                $opt_secondary = undef;
+                                # Take first of possibly several matching tags.
                                 last;
                             }
                         }
+                    }
+                    if ($log_code) {
+                        $new_rule->{log} = $log_code;
+                    }
+                    elsif ($router->{log_deny} && $deny) {
+                        $new_rule->{log} = 'log';
+                    }
 
-                        if ($type eq 'Subnet' or $type eq 'Interface') {
-                            my $net = $obj->{network};
-                            next if $net->{has_other_subnet};
-                            $obj = $net;
-                            if (my $max = $obj->{max_secondary_net}) {
+                    my $opt_secondary;
+                    if (   $secondary_filter && $rule->{some_non_secondary}
+                        || $standard_filter && $rule->{some_primary})
+                    {
+                        $opt_secondary = 1;
+
+                        for my $where (qw(src dst)) {
+                            my $obj = $rule->{$where};
+
+                            # Prepare secondary optimization.
+                            my $type = ref($obj);
+
+                            # Restrict secondary optimization at
+                            # authenticating router to prevent
+                            # unauthorized access with spoofed IP
+                            # address.
+                            if ($do_auth) {
+
+                                # Single ID-hosts must not be converted to
+                                # network.
+                                if ($type eq 'Subnet') {
+                                    next if $obj->{id};
+                                }
+
+                                # Network with ID-hosts must not be
+                                # optimized at all.
+                                if ($obj->{has_id_hosts}) {
+                                    $opt_secondary = undef;
+                                    last;
+                                }
+                            }
+
+                            if ($type eq 'Subnet' or $type eq 'Interface') {
+                                my $net = $obj->{network};
+                                next if $net->{has_other_subnet};
+                                $obj = $net;
+                                if (my $max = $obj->{max_secondary_net}) {
+                                    $obj = $max;
+                                }
+
+                                # Ignore loopback network.
+                                next if $obj->{mask} == 0xffffffff;
+                            }
+
+                            # Network or aggregate.
+                            else {
+                                my $max = $obj->{max_secondary_net} or next;
                                 $obj = $max;
                             }
 
-                            # Ignore loopback network.
-                            next if $obj->{mask} == 0xffffffff;
+                            my $addr = print_address($obj, $no_nat_set);
+                            $opt_addr{$addr} = 1;
                         }
-                        
-                        # Network or aggregate.
-                        else {
-                            my $max = $obj->{max_secondary_net} or next;
-                            $obj = $max;
-                        }
-
-                        my $addr = print_address($obj, $no_nat_set);
-                        $opt_addr{$addr} = 1;
+                        $new_rule->{opt_secondary} = 1 if $opt_secondary;
                     }
-                    $new_rule->{opt_secondary} = 1 if $opt_secondary;
+                    $new_rule->{src} = print_address($rule->{src}, $no_nat_set);
+                    $new_rule->{dst} = print_address($rule->{dst}, $no_nat_set);
+                    $new_rule->{prt} = print_prt($rule->{prt});
+                    if (my $src_range = $rule->{src_range}) {
+                        $new_rule->{src_range} = print_prt($src_range);
+                    }
+                    push @new_rules, $new_rule;
                 }
-                $new_rule->{src} = print_address($rule->{src}, $no_nat_set);
-                $new_rule->{dst} = print_address($rule->{dst}, $no_nat_set);
-                $new_rule->{prt} = print_prt($rule->{prt});
-                if (my $src_range = $rule->{src_range}) {
-                    $new_rule->{src_range} = print_prt($src_range);
-                }
-                push @new_rules, $new_rule;
+                $acl->{$what} = \@new_rules;
             }
-            $acl->{$what} = \@new_rules;
-        }
 
-        if (keys %opt_addr) {
-            $acl->{opt_secondary} = [ sort keys %opt_addr ];
+            if (keys %opt_addr) {
+                $acl->{opt_secondary} = [ sort keys %opt_addr ];
+            }
+            push @acl_list, $acl;
         }
     }
-    my $result = { model => $model->{class}, acls  => $acls, };
+
+    my $router = $vrf_members->[0];
+    my $model  = $router->{model};
+    my $result = { model => $model->{class}, acls  => \@acl_list };
 
     if (my $filter_only = $router->{filter_only}) {
         my @list = map { prefix_code($_) } @$filter_only;
@@ -17792,11 +17805,10 @@ sub print_code {
 
         # Print ACLs in machine independent format into separate file.
         # Collect ACLs from VRF parts.
-        my @acl_list = map { @{ delete $_->{acl_list} || [] } } @$vrf_members;
         my $acl_file = "$dir/$file.rules";
         open(my $acl_fd, '>', $acl_file)
           or fatal_err("Can't open $acl_file for writing: $!");
-        print_acls($router, \@acl_list, $acl_fd);
+        print_acls($vrf_members, $acl_fd);
         close $acl_fd or fatal_err("Can't close $acl_file: $!");
 
     }

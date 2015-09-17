@@ -2202,7 +2202,7 @@ sub print_combined {
 sub pass2 {
     my ($args) = @_;
     my ($dir, @extra) = @$args;
-    ($dir || @extra) or pod2usage(2);
+    ($dir and not @extra) or pod2usage(2);
     for my $config_path (glob("$dir/*.config")) {
         my $base_path = "$dir/" . basename($config_path, '.config');
         my $rules_path = "$base_path.rules";

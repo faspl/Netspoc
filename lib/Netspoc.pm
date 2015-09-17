@@ -16933,11 +16933,12 @@ sub print_ezvpn {
 
     # Crypto filter ACL.
     $acl_info = {
-        name => $crypto_filter_name,
-        rules => $tunnel_intf->{rules} || [],
-        intf_rules => $tunnel_intf->{intf_rules} || [],
-        add_deny => 1,
-        no_nat_set => $no_nat_set,
+        name         => $crypto_filter_name,
+        rules        => $tunnel_intf->{rules} || [],
+        intf_rules   => $tunnel_intf->{intf_rules} || [],
+        add_deny     => 1,
+        protect_self => 1,
+        no_nat_set   => $no_nat_set,
     };
     push @{ $router->{acl_list} }, $acl_info;
     print_acl_placeholder($crypto_filter_name);
@@ -16989,11 +16990,12 @@ sub print_crypto_filter_acl {
     my $model      = $router->{model};
     my $no_nat_set = $interface->{no_nat_set};
     my $acl_info = {
-        name => $crypto_filter_name,
-        rules => $interface->{rules} || [],
-        intf_rules => $interface->{intf_rules} || [],
-        add_deny => 1,
-        no_nat_set => $no_nat_set,
+        name         => $crypto_filter_name,
+        rules        => $interface->{rules} || [],
+        intf_rules   => $interface->{intf_rules} || [],
+        add_deny     => 1,
+        protect_self => 1,
+        no_nat_set   => $no_nat_set,
     };
     push @{ $router->{acl_list} }, $acl_info;
     print_acl_placeholder($crypto_filter_name);

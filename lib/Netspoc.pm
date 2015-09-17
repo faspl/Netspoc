@@ -16399,28 +16399,36 @@ EOF
                     }
                     if (not $acl_name) {
                         $acl_name = "split-tunnel-$user_counter";
+                        my @rules;
                         if (@$split_tunnel_nets) {
                             for my $network (@$split_tunnel_nets) {
-                                my $line =
-                                  "access-list $acl_name standard permit ";
-                                $line .=
-                                  cisco_acl_addr(address($network, $no_nat_set),
-                                    $model);
-                                print "$line\n";
+                                push @rules, {
+                                    src => $network,
+                                    dst => $network_00,
+                                    prt => $prt_ip,
+                                };
                             }
                         }
                         else {
-                            print "access-list $acl_name standard deny any\n";
+                            push @rules, $deny_any_rule;
                         }
                         $split_t_cache{@$split_tunnel_nets}->{$acl_name} =
                           $split_tunnel_nets;
+                        my $acl_info = {
+                            name          => $acl_name,
+                            rules         => \@rules,
+                            no_nat_set    => $no_nat_set,
+                            is_std_acl    => 1,
+                            is_crypto_acl => 1,
+                        };
+                        push @{ $router->{acl_list} }, $acl_info;
+                        print_acl_placeholder($acl_name);
                     }
                     $attributes->{'split-tunnel-network-list'} = $acl_name;
                 }
 
                 # Access list will be bound to cleartext interface.
                 # Only check for valid source address at vpn-filter.
-                $id_intf->{intf_rules} = [];
                 $id_intf->{rules}      = [
                     {
                         src => $src,
@@ -17628,10 +17636,17 @@ sub print_acls {
                             my $net = $obj->{network};
                             next if $net->{has_other_subnet};
                             $obj = $net;
+                            if (my $max = $obj->{max_secondary_net}) {
+                                $obj = $max;
+                            }
                         }
-                        if (my $max = $obj->{max_secondary_net}) {
+                        
+                        # Network or aggregate.
+                        else {
+                            my $max = $obj->{max_secondary_net} or next;
                             $obj = $max;
                         }
+
                         my $addr = print_address($obj, $no_nat_set);
                         $opt_addr{$addr} = 1;
                     }

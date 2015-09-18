@@ -16026,7 +16026,7 @@ sub distribute_general_permit {
                 my $id_rules = $in_intf->{id_rules};
                 for my $src (
                     $id_rules
-                    ? map({ $_->{src} } values %$id_rules)
+                    ? sort by_name map({ $_->{src} } values %$id_rules)
                     : @{ $in_intf->{peer_networks} }
                   )
                 {

@@ -2208,6 +2208,7 @@ sub print_combined {
 # exist in directory .prev/ .
 sub check_prev {
     my ($base_path) = @_;
+    -f ".prev/$base_path" or return;
     for my $ext (qw(.config .rules)) {
         my $path = "$base_path$ext";
         my $prev_path = ".prev/$path";
@@ -2246,14 +2247,22 @@ sub pass2 {
     }
 
     # Generate new code files.
-    $count = @pass2_list;
-    info("Optimizing and printing code for $count devices");
-    for my $base_path (@pass2_list) {
-        my $config_path = "$base_path.config";
-        my $rules_path  = "$base_path.rules";
-        my $router_data = prepare_acls($rules_path);
-        my $config = read_file_lines($config_path);
-        print_combined($config, $router_data, $base_path);
+    if ($count = @pass2_list) {
+        info("Generating optimized code for $count devices");
+        for my $base_path (@pass2_list) {
+            my $config_path = "$base_path.config";
+            my $rules_path  = "$base_path.rules";
+            my $router_data = prepare_acls($rules_path);
+            my $config = read_file_lines($config_path);
+            print_combined($config, $router_data, $base_path);
+        }
+    }
+
+    # Remove directory '.prev', if created by pass1.
+    # Don't remove if '.prev' is symlink created by newpolicy.pl.
+    if ($has_prev and not -l '.prev') {
+        system("rm -r .prev") == 0 or
+            fatal_err("Can't remove $dir/.prev: $!");
     }
 }
 

@@ -2212,7 +2212,7 @@ sub check_prev {
         my $path = "$base_path$ext";
         my $prev_path = ".prev/$path";
         -f $prev_path or return;
-        system("cmp $path $prev_path") == 0 or return;
+        system("cmp -s $path $prev_path") == 0 or return;
     }
     return 1;        
 }

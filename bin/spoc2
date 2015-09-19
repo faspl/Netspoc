@@ -553,7 +553,7 @@ sub optimize_rules {
 
 # Join adjacent port ranges.
 sub join_ranges {
-    my ($rules, $prt_hash) = @_;
+    my ($rules, $prt2obj) = @_;
     my $changed;
     my %rule_tree = ();
   RULE:
@@ -660,17 +660,17 @@ sub join_ranges {
             if (my $range = delete $rule->{range}) {
                 my $prt   = $rule->{prt};
                 my $proto = $prt->{proto};
-                my $key   = join(':', @$range);
+                my $key   = "$proto $range->[0]-$range->[1]";
 
                 # Try to find existing prt with matching range.
                 # This is needed for find_objectgroups to work.
-                my $new_prt = $prt_hash->{$proto}->{$key};
+                my $new_prt = $prt2obj->{$key};
                 if (not $new_prt) {
                     $new_prt = {
                         proto => $proto,
                         range => $range
                     };
-                    $prt_hash->{$proto}->{$key} = $new_prt;
+                    $prt2obj->{$key} = $new_prt;
                 }
                 my $new_rule = { %$rule, prt => $new_prt };
                 push @rules, $new_rule;
@@ -1929,7 +1929,7 @@ sub prepare_acls {
             add_tcp_udp_icmp($prt2obj);
         }
         
-        my $prt_hash = setup_prt_relation($prt2obj);
+        setup_prt_relation($prt2obj);
         my $prt_ip = $acl_info->{prt_ip} = $prt2obj->{ip};
         
         if ($model eq 'Linux') {
@@ -1943,7 +1943,7 @@ sub prepare_acls {
                 # Join adjacent port ranges. This must be called after
                 # local optimization, because protocols will be
                 # overlapping again after joining.
-                $rules = join_ranges($rules, $prt_hash);
+                $rules = join_ranges($rules, $prt2obj);
                 $acl_info->{$what} = $rules;
             }
 

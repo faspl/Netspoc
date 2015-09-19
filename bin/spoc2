@@ -1892,15 +1892,15 @@ sub prepare_acls {
         for my $what (qw(intf_rules rules)) {
             my $rules = $acl_info->{$what} or next;
             for my $rule (@$rules) {
-                for my $where (qw(src dst)) {
-                    my $ip_net = $rule->{$where};
-                    my $obj = $ip_net2obj->{$ip_net} ||= create_ip_obj($ip_net);
-                    $rule->{$where} = $obj;
-                }
-                for my $where (qw(src_range prt)) {
-                    my $prt = $rule->{$where} or next;
-                    my $obj = $prt2obj->{$prt} ||= create_prt_obj($prt);
-                    $rule->{$where} = $obj;
+                my $ip_net = $rule->{src};
+                $rule->{src} = $ip_net2obj->{$ip_net} ||= create_ip_obj($ip_net);
+                $ip_net = $rule->{dst};
+                $rule->{dst} = $ip_net2obj->{$ip_net} ||= create_ip_obj($ip_net);
+                my $prt = $rule->{prt};
+                $rule->{prt} = $prt2obj->{$prt} ||= create_prt_obj($prt);
+                if (my $prt = $rule->{src_range}) {
+                    $rule->{src_range} = 
+                        $prt2obj->{$prt} ||= create_prt_obj($prt);
                 }
             }
         }

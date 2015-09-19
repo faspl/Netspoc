@@ -498,8 +498,8 @@ sub optimize_rules {
     $changed ||= $changed2;
 
     # Implement rules as secondary rule, if possible.
-    my %secondary_rule_tree;
-    my $ip_name = $prt_ip->{name};
+    my %secondary_tree;
+    my $ip_key = $prt_ip->{name};
   RULE:
     for my $rule (@$rules) {
         $rule->{opt_secondary} or next;
@@ -518,12 +518,12 @@ sub optimize_rules {
         # Change protocol to IP.
         $rule->{prt} = $prt_ip;
 
-        # Add new rule to secondary_rule_tree. If multiple rules are
+        # Add new rule to secondary_tree. If multiple rules are
         # converted to the same secondary rule, only the first one
         # will be created.
         $src = $src->{name};
         $dst = $dst->{name};
-        if ($secondary_rule_tree{''}->{$ip_name}->{$src}->{$dst}->{$ip_name}) {
+        if ($secondary_tree{''}->{$ip_key}->{$src}->{$dst}->{$ip_key}) {
 
 #           debug("sec delete: ", print_rule $rule);
             $rule->{deleted} = 1;
@@ -532,16 +532,16 @@ sub optimize_rules {
         else {
 
 #           debug("sec: ", print_rule $rule);
-            $secondary_rule_tree{''}->{$ip_name}->{$src}->{$dst}->{$ip_name} = 
+            $secondary_tree{''}->{$ip_key}->{$src}->{$dst}->{$ip_key} = 
                 $rule;
         }
     }
 
     if (keys %secondary_rule_tree) {
-        $changed2 = optimize_redundant_rules(\%secondary_rule_tree, 
-                                             \%secondary_rule_tree, $acl_info);
+        $changed2 = optimize_redundant_rules(\%secondary_tree, 
+                                             \%secondary_tree, $acl_info);
         $changed ||= $changed2;
-        $changed2 = optimize_redundant_rules(\%secondary_rule_tree, 
+        $changed2 = optimize_redundant_rules(\%secondary_tree, 
                                              \%rule_tree, $acl_info);
         $changed ||= $changed2;
     }

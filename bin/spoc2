@@ -465,7 +465,8 @@ sub optimize_redundant_rules {
 }
 
 sub optimize_rules {
-    my ($rules, $acl_info, $prt_ip) = @_;
+    my ($rules, $acl_info) = @_;
+    my $prt_ip = $acl_info->{prt2obj}->{ip};
     
     # For comparing redundant rules.
     my %rule_tree;
@@ -1930,7 +1931,7 @@ sub prepare_acls {
         }
         
         setup_prt_relation($prt2obj);
-        my $prt_ip = $acl_info->{prt_ip} = $prt2obj->{ip};
+        $acl_info->{prt_ip} = $prt2obj->{ip};
         
         if ($model eq 'Linux') {
             find_chains($acl_info, $router_data);
@@ -1938,7 +1939,7 @@ sub prepare_acls {
         else {
             for my $what (qw(intf_rules rules)) {
                 my $rules = $acl_info->{$what} or next;
-                $rules = optimize_rules($rules, $acl_info, $prt_ip);
+                $rules = optimize_rules($rules, $acl_info);
     
                 # Join adjacent port ranges. This must be called after
                 # local optimization, because protocols will be

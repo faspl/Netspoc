@@ -401,12 +401,76 @@ sub setup_prt_relation {
     return \%prt_hash;
 }
 
-sub local_optimization {
-    my ($rules, $prt_ip) = @_;
+sub print_rule {
+    my ($rule) = @_;
+    my ($deny, $src, $dst, $prt) = @{$rule}{qw(deny src dst prt)};
+    my $action = $deny ? 'deny' : 'permit';
+    return "$action $src->{name} $dst->{name} $prt->{name}";
+}
+
+sub optimize_redundant_rules {
+    my ($cmp_hash, $chg_hash, $acl_info) = @_;
+    my $ip_net2obj = $acl_info->{ip_net2obj};
+    my $prt2obj    = $acl_info->{prt2obj};
+    my $changed;
+    while (my ($deny, $chg_hash) = each %$chg_hash) {
+     while (1) {
+      if (my $cmp_hash = $cmp_hash->{$deny}) {
+       while (my ($src_range_name, $chg_hash) = each %$chg_hash) {
+        my $src_range = $prt2obj->{$src_range_name};
+        while (1) {
+         if (my $cmp_hash = $cmp_hash->{$src_range->{name}}) {
+          while (my ($src_name, $chg_hash) = each %$chg_hash) {
+           my $src = $ip_net2obj->{$src_name};
+           while (1) {
+            if (my $cmp_hash = $cmp_hash->{$src->{name}}) {
+             while (my ($dst_name, $chg_hash) = each %$chg_hash) {
+              my $dst = $ip_net2obj->{$dst_name};
+              while (1) {
+               if (my $cmp_hash = $cmp_hash->{$dst->{name}}) {
+                for my $chg_rule (values %$chg_hash) {
+                 next if $chg_rule->{deleted};
+                 my $prt = $chg_rule->{prt};
+                 my $chg_log = $chg_rule->{log} || '';
+                 while (1) {
+                  if (my $cmp_rule = $cmp_hash->{$prt->{name}}) {
+                   my $cmp_log = $cmp_rule->{log} || '';
+                   if ($cmp_rule ne $chg_rule && $cmp_log eq $chg_log) {
+                    $chg_rule->{deleted} = $cmp_rule;
+                    $changed = 1;
+                    last;
+                   }
+                  }
+                  $prt = $prt ->{up} or last;
+                 }
+                }
+               }
+               $dst = $dst->{up} or last;
+              }
+             }
+            }
+            $src = $src->{up} or last;
+           }
+          }
+         }
+         $src_range = $src_range->{up} or last;
+        }
+       }
+      }
+      last if $deny;
+      $deny = 1;
+     }
+    }
+    return $changed;
+}
+
+sub optimize_rules {
+    my ($rules, $acl_info, $prt_ip) = @_;
     
-    # For comparing rules during optimization.
+    # For comparing redundant rules.
     my %rule_tree;
 
+    # Fill rule tree.
     my $changed = 0;
     for my $rule (@$rules) {
 
@@ -414,68 +478,33 @@ sub local_optimization {
             @{$rule}{qw(src dst deny src_range prt)};
         $deny      ||= '';
         $src_range ||= $prt_ip;
+        $src = $src->{name};
+        $dst = $dst->{name};
+        $src_range = $src_range->{name};
+        $prt = $prt->{name};
 
         # Remove duplicate rules.
         if ($rule_tree{$deny}->{$src_range}->{$src}->{$dst}->{$prt}) {
-            $rule    = undef;
+            $rule->{deleted} = 1;
             $changed = 1;
             next;
         }
         $rule_tree{$deny}->{$src_range}->{$src}->{$dst}->{$prt} = $rule;
     }
 
+    my $changed2 =
+        optimize_redundant_rules (\%rule_tree, \%rule_tree, $acl_info);
+    $changed ||= $changed2;
+
+    # Implement rules as secondary rule, if possible.
+    my %secondary_rule_tree;
+    my $ip_name = $prt_ip->{name};
   RULE:
     for my $rule (@$rules) {
-        next if not $rule;
-        my ($deny, $src, $dst, $src_range, $prt, $log) =
-            @{$rule}{qw(deny src dst src_range prt log)};
-        $deny      ||= '';
-        $src_range ||= $prt_ip;
-        $log       ||= '';
-
-        while (1) {
-            my $src_range = $src_range;
-            if (my $rule_tree = $rule_tree{$deny}) {
-                while (1) {
-                    my $src = $src;
-                    if (my $rule_tree = $rule_tree->{$src_range}) {
-                        while (1) {
-                            my $dst = $dst;
-                            if (my $rule_tree = $rule_tree->{$src}) {
-                                while (1) {
-                                    my $prt = $prt;
-                                    if (my $rule_tree = $rule_tree->{$dst}) {
-                                        while (1) {
-                                            if (my $other = $rule_tree->{$prt})
-                                            {
-                                                my $o_log = $other->{log} || '';
-                                                if ($rule ne $other
-                                                    && $log eq $o_log)
-                                                {
-                                                    $rule = undef;
-                                                    $changed = 1;
-                                                    next RULE;
-                                                }
-                                            }
-                                            $prt = $prt->{up} or last;
-                                        }
-                                    }
-                                    $dst = $dst->{up} or last;
-                                }
-                            }
-                            $src = $src->{up} or last;
-                        }
-                    }
-                    $src_range = $src_range->{up} or last;
-                }
-            }
-            last if $deny;
-            $deny = 1;
-        }
-
-        # Implement remaining rules as secondary rule, if possible.
         $rule->{opt_secondary} or next;
-        $rule->{deny} and fatal_err("Unexpected deny rule with opt_secondary");
+        next if $rule->{deleted};
+
+        my ($src, $dst, $prt) = @{$rule}{qw(src dst prt)};
 
         # Replace obj by supernet.
         if (my $supernet = $src->{opt_secondary}) {
@@ -488,27 +517,36 @@ sub local_optimization {
         # Change protocol to IP.
         $rule->{prt} = $prt_ip;
 
-        # Add new rule to rule_tree. If multiple rules are converted to the
-        # same secondary rule, only the first one will be generated.
-        if (my $other = $rule_tree{''}->{$prt_ip}->{$src}->{$dst}->{$prt_ip}) {
-
-            # Don't remove if rule already was in optimized form.
-            next if $rule eq $other;
+        # Add new rule to secondary_rule_tree. If multiple rules are
+        # converted to the same secondary rule, only the first one
+        # will be created.
+        $src = $src->{name};
+        $dst = $dst->{name};
+        if ($secondary_rule_tree{''}->{$ip_name}->{$src}->{$dst}->{$ip_name}) {
 
 #           debug("sec delete: ", print_rule $rule);
-            $rule    = undef;
+            $rule->{deleted} = 1;
             $changed = 1;
         }
         else {
 
-#            debug("sec: ", print_rule $rule);
-            # Further optimization only works if smaller rule hasn't
-            # already been processed.
-            $rule_tree{''}->{$prt_ip}->{$src}->{$dst}->{$prt_ip} = $rule;
+#           debug("sec: ", print_rule $rule);
+            $secondary_rule_tree{''}->{$ip_name}->{$src}->{$dst}->{$ip_name} = 
+                $rule;
         }
     }
+
+    if (keys %secondary_rule_tree) {
+        $changed2 = optimize_redundant_rules(\%secondary_rule_tree, 
+                                             \%secondary_rule_tree, $acl_info);
+        $changed ||= $changed2;
+        $changed2 = optimize_redundant_rules(\%secondary_rule_tree, 
+                                             \%rule_tree, $acl_info);
+        $changed ||= $changed2;
+    }
+
     if ($changed) {
-        $rules = [ grep { $_ } @$rules ];
+        $rules = [ grep { not $_->{deleted} } @$rules ];
     }
     return $rules;
 }
@@ -1900,7 +1938,7 @@ sub prepare_acls {
         else {
             for my $what (qw(intf_rules rules)) {
                 my $rules = $acl_info->{$what} or next;
-                $rules = local_optimization($rules, $prt_ip);
+                $rules = optimize_rules($rules, $acl_info, $prt_ip);
     
                 # Join adjacent port ranges. This must be called after
                 # local optimization, because protocols will be

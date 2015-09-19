@@ -1926,39 +1926,41 @@ sub prepare_acls {
     return $router_data;
 }
 
-# Given IP/prefix or group name, return its address in Cisco syntax.
+# Given IP or group object, return its address in Cisco syntax.
 sub cisco_acl_addr {
-    my ($key, $model) = @_;
-    my ($ip, $prefix) = split '/', $key;
+    my ($obj, $model) = @_;
+    my ($ip, $mask) = @{$obj}{qw(ip mask)};
 
-    # Reference object group.
-    if ($ip =~ /^[^0-9]/) {
+    # Object group.
+    if (not defined $ip) {
         my $keyword = $model eq 'NX-OS' ? 'addrgroup' : 'object-group';
-        return "$keyword $key";
+        return "$keyword $obj->{name}";
     }
-    elsif ($prefix == 0) {
+    elsif ($mask == 0) {
         return "any";
     }
     elsif ($model eq 'NX-OS') {
-        return $key;
+        return $obj->{name};
     }
     else {
-        if (32 == $prefix) {
-            return "host $ip";
+        my $ip_code = int2ip($ip);
+        if (0xffffffff == $mask) {
+            return "host $ip_code";
         }
         else {
-            my $mask = prefix2mask($prefix);
 
             # Inverse mask bits.
-            $mask = complement_32bit($mask) if $model =~ /^(:?NX-OS|IOS)/;
+            $mask = complement_32bit($mask) if $model =~ /^(:?NX-OS|IOS)$/;
             my $mask_code = int2ip($mask);
-            return "$ip $mask_code";
+            return "$ip_code $mask_code";
         }
     }
+    return;
 }
 
 sub print_object_groups {
-    my ($groups, $model) = @_;
+    my ($groups, $acl_info, $model) = @_;
+    my $ip_net2obj = $acl_info->{ip_net2obj};
     my $keyword = $model eq 'NX-OS'
                 ? 'object-group ip address'
                 : 'object-group network';
@@ -1974,7 +1976,7 @@ sub print_object_groups {
                 and fatal_err(
                     "Unexpected network with mask 0 in object-group"
                 );
-            my $adr = cisco_acl_addr($key, $model);
+            my $adr = cisco_acl_addr($ip_net2obj->{$key}, $model);
             if ($model eq 'NX-OS') {
                 print " $numbered $adr\n";
                 $numbered += 10;
@@ -2075,9 +2077,8 @@ sub print_cisco_std_acl {
     for my $rule (@$rules) {
         my ($deny, $src) = @{$rule}{qw(deny src)};
         my $action = $deny ? 'deny' : 'permit';
-        my $skey = $src->{name};
         my $result = "$prefix $action";
-        $result .= ' ' . cisco_acl_addr($skey, $model);
+        $result .= ' ' .  cisco_acl_addr($src, $model);
         print "$result\n";
     }
     return;
@@ -2118,15 +2119,12 @@ sub print_cisco_acl {
         my ($deny, $src, $dst, $src_range, $prt) =
           @{$rule}{qw(deny src dst src_range prt)};
         my $action = $deny ? 'deny' : 'permit';
-        my $skey = $src->{name};
-        my $dkey = $dst->{name};
-
         my ($proto_code, $src_port_code, $dst_port_code) =
           cisco_prt_code($src_range, $prt, $model);
         my $result = "$prefix $action $proto_code";
-        $result .= ' ' . cisco_acl_addr($skey, $model);
+        $result .= ' ' . cisco_acl_addr($src, $model);
         $result .= " $src_port_code" if defined $src_port_code;
-        $result .= ' ' . cisco_acl_addr($dkey, $model);
+        $result .= ' ' . cisco_acl_addr($dst, $model);
         $result .= " $dst_port_code" if defined $dst_port_code;
 
         if (my $log = $rule->{log}) {
@@ -2158,7 +2156,7 @@ sub print_acl {
     }
     else {
         if (my $groups = $acl_info->{object_groups}) {
-            print_object_groups($groups, $model);
+            print_object_groups($groups, $acl_info, $model);
         }    
         print_cisco_acl($acl_info, $model);
     }

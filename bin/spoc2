@@ -659,8 +659,7 @@ sub join_ranges {
             # Process rules with joined port ranges.
             # Remove auxiliary attribute {range} from rules.
             if (my $range = delete $rule->{range}) {
-                my $prt   = $rule->{prt};
-                my $proto = $prt->{proto};
+                my $proto = $rule->{prt}->{proto};
                 my $key   = "$proto $range->[0]-$range->[1]";
 
                 # Try to find existing prt with matching range.

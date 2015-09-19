@@ -107,13 +107,6 @@ sub complement_32bit {
     return ~$ip & 0xffffffff;
 }
 
-sub ip_net2pair {
-    my ($ip_net) = @_;
-    my ($ip, $len) = split '/', $ip_net;
-    $ip = ip2int($ip);
-    return ($ip, $len);    
-}
-
 # Conversion from netmask to prefix and vice versa.
 {
 
@@ -701,6 +694,7 @@ my $min_object_group_size = 2;
 
 sub find_objectgroups {
     my ($acl_info, $router_data) = @_;
+    my $ip_net2obj = $acl_info->{ip_net2obj};
 
     # Reuse identical groups from different ACLs.
     my $size2first2group = $router_data->{obj_groups_hash} ||= {};
@@ -776,9 +770,9 @@ sub find_objectgroups {
             # Sort keys by IP and prefixlen for normalized output and
             # to get some "first" element.
             my @obj_key_list  =
-                map { $_->[0] }
-                sort { $a->[1] <=> $b->[1] || $a->[2] <=> $b->[2] }
-                map { [ $_, ip_net2pair($_) ] }
+                map { $_->{name} }
+                sort { $a->{ip} <=> $b->{ip} || $a->{mask} <=> $b->{mask} }
+                map { $ip_net2obj->{$_} }
                 keys %$hash;
 
             my $first = $obj_key_list[0];

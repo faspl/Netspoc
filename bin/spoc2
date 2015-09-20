@@ -237,44 +237,13 @@ sub add_tcp_udp_icmp {
     $prt2obj->{icmp} ||= create_prt_obj('icmp');
 }
 
-sub order_icmp {
-    my ($hash, $up) = @_;
-
-    # Handle 'icmp any'.
-    if (my $prt = $hash->{''}) {
-        $prt->{up} = $up;
-        $up = $prt;
-    }
-    for my $prt (values %$hash) {
-
-        # 'icmp any' has been handled above.
-        if (!defined $prt->{type}) {
-        }
-        elsif (defined $prt->{code}) {
-            $prt->{up} = ($hash->{ $prt->{type} } or $up);
-        }
-        else {
-            $prt->{up} = $up;
-        }
-    }
-    return;
-}
-
-sub order_proto {
-    my ($hash, $up) = @_;
-    for my $prt (values %$hash) {
-        $prt->{up} = $up;
-    }
-    return;
-}
-
 # Set {up} relation from port range to the smallest port range which
 # includes it.
 # If no including range is found, link it with next larger protocol.
 # Set attribute {has_neighbor} to range adjacent to upper port.
 # Abort on overlapping ranges.
 sub order_ranges {
-    my ($range_href, $up) = @_;
+    my ($proto, $prt2obj, $up) = @_;
     my @sorted =
 
       # Sort by low port. If low ports are equal, sort reverse by high port.
@@ -283,7 +252,9 @@ sub order_ranges {
       sort {
              $a->{range}->[0] <=> $b->{range}->[0]
           || $b->{range}->[1] <=> $a->{range}->[1]
-      } values %$range_href;
+      } 
+      grep { $_->{proto} eq $proto and not $_->{established} } 
+      values %$prt2obj;
 
     # Check current range [a1, a2] for sub-ranges, starting at position $i.
     # Set attributes {up} and {has_neighbor}.
@@ -355,50 +326,39 @@ sub order_ranges {
 sub setup_prt_relation {
     my ($prt2obj) = @_;
     my $prt_ip = $prt2obj->{ip} ||= create_prt_obj('ip');
-    my $tcp_establ;
+    my $icmp_up = $prt2obj->{icmp} || $prt_ip;
     my %prt_hash;
     for my $prt (values %$prt2obj) {
         my $proto = $prt->{proto};
-        if ($proto eq 'tcp' or $proto eq 'udp') {
-
-            # Handle separately.
-            if ($prt->{established}) {
-                $tcp_establ = $prt;
-                next;
+        if ($proto eq 'icmp') {
+            my ($type, $code) = @{$prt}{qw(type code)};
+            if (defined $type) {
+                if (defined $prt->{code}) {
+                    $prt->{up} = $prt2obj->{"icmp $type"} || $icmp_up;
+                }
+                else {
+                    $prt->{up} = $icmp_up;
+                }
             }
-
-            my $range = $prt->{range};
-            my $key = join ':', @$range;
-            $prt_hash{$proto}->{$key} = $prt;
+            else {
+                $prt->{up} = $prt_ip;
+            }
         }
-        elsif ($proto eq 'icmp') {
-            my $type = $prt->{type};
-            my $code = $prt->{code};
-            my $key  = 
-                defined $type ? (defined $code ? "$type:$code" : $type) : '';
-            $prt_hash{$proto}->{$key} = $prt;
-        }
-        elsif ($proto eq 'ip') {
-            $prt_hash{$proto} = $prt;
-        }
-        else {
             
-            # Other protocol.
-            my $key = $proto;
-            $prt_hash{proto}->{$key} = $prt;
+        # Numeric protocol.
+        elsif ($proto =~ /^\d+$/) {
+            my $prt->{up} = $prt_ip;
         }
     }
-    my $up = $prt_ip;
-    order_ranges($prt_hash{tcp}, $up);
-    order_ranges($prt_hash{udp}, $up);
-    order_icmp($prt_hash{icmp}, $up);
-    order_proto($prt_hash{proto}, $up);
 
-    if ($tcp_establ) {
-        $tcp_establ->{up} = $prt_hash{tcp}->{'1:65535'} || $up;
+    order_ranges('tcp', $prt2obj, $prt_ip);
+    order_ranges('udp', $prt2obj, $prt_ip);
+
+    if (my $tcp_establ = $prt2obj->{'tcp establ'}) {
+        $tcp_establ->{up} = $prt2obj->{'tcp 1-65535'} || $prt_ip;
     }
 
-    return \%prt_hash;
+    return;
 }
 
 sub print_rule {

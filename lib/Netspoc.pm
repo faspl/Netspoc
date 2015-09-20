@@ -17494,8 +17494,7 @@ sub print_prt {
     my @result = ($proto);
 
     if ($proto eq 'tcp' or $proto eq 'udp') {
-        my ($v1, $v2) = @{ $prt->{range} };
-        push @result, "$v1-$v2";
+        push @result,  @{ $prt->{range} };
         push @result, 'established' if $prt->{established};
     }
     elsif ($proto eq 'icmp') {

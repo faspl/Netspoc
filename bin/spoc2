@@ -174,7 +174,7 @@ sub setup_ip_net_relation {
     $ip_net2obj->{'0.0.0.0/0'} ||= create_ip_obj('0.0.0.0/0');
     my %mask_ip_hash;
 
-    # Collect networks in %mask_ip_hash.
+    # Collect networks into %mask_ip_hash.
     for my $network (values %$ip_net2obj) {
         my ($ip, $mask) = @{$network}{qw(ip mask)};
         $mask_ip_hash{$mask}->{$ip} = $network;        
@@ -229,6 +229,7 @@ sub mark_supernets_of_need_protect {
     }
 }
 
+# Needed for model=Linux.
 sub add_tcp_udp_icmp {
     my ($prt2obj) = @_;
     $prt2obj->{'tcp 1 65535'} ||= create_prt_obj('tcp 1 65535');
@@ -2247,7 +2248,7 @@ sub pass2 {
     my @pass2_list;
 
     my $count = @pass1_list;
-    info("Starting second pass for $count devices");
+    info("Starting second pass");
     my $reused;
     for my $base_path (@pass1_list) {
 

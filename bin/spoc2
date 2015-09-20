@@ -537,7 +537,7 @@ sub optimize_rules {
         }
     }
 
-    if (keys %secondary_rule_tree) {
+    if (keys %secondary_tree) {
         $changed2 = optimize_redundant_rules(\%secondary_tree, 
                                              \%secondary_tree, $acl_info);
         $changed ||= $changed2;

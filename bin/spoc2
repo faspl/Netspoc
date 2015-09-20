@@ -354,7 +354,7 @@ sub setup_prt_relation {
     order_ranges('tcp', $prt2obj, $prt_ip);
     order_ranges('udp', $prt2obj, $prt_ip);
 
-    if (my $tcp_establ = $prt2obj->{'tcp establ'}) {
+    if (my $tcp_establ = $prt2obj->{'tcp 1-65535 established'}) {
         $tcp_establ->{up} = $prt2obj->{'tcp 1-65535'} || $prt_ip;
     }
 
@@ -396,6 +396,8 @@ sub optimize_redundant_rules {
                   if (my $cmp_rule = $cmp_hash->{$prt->{name}}) {
                    my $cmp_log = $cmp_rule->{log} || '';
                    if ($cmp_rule ne $chg_rule && $cmp_log eq $chg_log) {
+
+#                   debug "del: ", print_rule $chg_rule;
                     $chg_rule->{deleted} = $cmp_rule;
                     $changed = 1;
                     last;

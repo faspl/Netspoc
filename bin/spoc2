@@ -2280,7 +2280,7 @@ sub pass2 {
     # Remove directory '.prev', if created by pass1.
     # Don't remove if '.prev' is symlink created by newpolicy.pl.
     if ($has_prev and not -l '.prev') {
-        system("rm -r .prev") == 0 or
+        system("rm -rf .prev") == 0 or
             fatal_err("Can't remove $dir/.prev: $!");
     }
 }
